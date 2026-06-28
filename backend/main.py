@@ -30,11 +30,13 @@ log = logging.getLogger("artenisa")
 
 app = FastAPI(title="Artenisa API")
 
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
@@ -45,13 +47,14 @@ UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "data/uploads"))
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
 TOOL_TIMEOUT = int(os.getenv("TOOL_TIMEOUT", "60"))
 
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", str(20 * 1024 * 1024)))  # 20MB
+ALLOWED_EXTENSIONS = {".wav", ".mp3", ".ogg", ".flac", ".m4a", ".png", ".jpg", ".jpeg", ".gif", ".pdf", ".txt", ".py", ".md", ".json"}
 os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 
 if not AUTH_TOKEN or len(AUTH_TOKEN) < 12:
-    log.warning("⚠️  AUTH_TOKEN débil o vacío — configura uno seguro con >=12 caracteres")
-    if not AUTH_TOKEN:
-        AUTH_TOKEN = "cambia-este-token-urgentemente"
+    AUTH_TOKEN = os.urandom(32).hex()
+    log.warning(f"⚠️  AUTH_TOKEN generado automáticamente: {AUTH_TOKEN}")
+    log.warning("   Configura uno fijo en backend/.env con AUTH_TOKEN=tu-token-seguro")
 
 # ─── SQLite optimizado: WAL mode + connection pool ───
 
@@ -71,7 +74,7 @@ def db():
     try:
         yield conn
         conn.commit()
-    except:
+    except Exception:
         conn.rollback()
         raise
 
@@ -111,12 +114,13 @@ init_db()
 
 # ─── httpx client reutilizable ───
 
+_httpx_timeout = int(os.getenv("HTTPX_TIMEOUT", "30"))
 _httpx_client = None
 
 def get_httpx():
     global _httpx_client
     if _httpx_client is None:
-        _httpx_client = httpx.Client(timeout=120)
+        _httpx_client = httpx.Client(timeout=_httpx_timeout)
     return _httpx_client
 
 # ─── Modelos ───
@@ -286,9 +290,18 @@ def build_prompt(history: list, new_message: str, memories: dict) -> str:
     parts.append("<|im_start|>assistant\n")
     return "\n".join(parts)
 
-# ─── Tool execution ───
+import shlex
 
-TOOL_CMD_RE = re.compile(r'!ejecutar:\s*(.+)', re.IGNORECASE)
+# ─── Seguridad: evitar shell=True ───
+
+def _safe_args(cmd: str) -> list:
+    """Convierte un comando string en lista de argumentos segura."""
+    try:
+        return shlex.split(cmd, posix=False)
+    except ValueError:
+        return cmd.split()
+
+TOOL_CMD_RE
 TOOL_SEARCH_RE = re.compile(r'!buscar:\s*(.+)', re.IGNORECASE)
 TOOL_READ_RE = re.compile(r'!leer:\s*(.+)', re.IGNORECASE)
 TOOL_WRITE_RE = re.compile(r'!escribir:\s*(.+)', re.IGNORECASE)
@@ -334,23 +347,23 @@ def parse_tool_commands(text: str) -> list:
     return commands
 
 TOOL_INSTALLERS = {
-    "nmap": "winget install --id Insecure.Nmap -e --source winget",
-    "curl": "winget install --id cURL.cURL -e --source winget",
-    "wget": "winget install --id GNU.Wget2 -e --source winget",
-    "ping": "echo ya instalado en Windows",
-    "tracert": "echo ya instalado en Windows",
-    "netstat": "echo ya instalado en Windows",
-    "ipconfig": "echo ya instalado en Windows",
-    "findstr": "echo ya instalado en Windows",
-    "python": "echo ya instalado",
-    "pip": "echo ya instalado",
-    "ssh": "winget install --id Microsoft.OpenSSH.Beta -e --source winget",
-    "git": "winget install --id Git.Git -e --source winget",
-    "whois": "winget install --id whois -e --source winget",
-    "dig": "winget install --id BIND.BIND -e --source winget",
-    "nslookup": "echo ya instalado en Windows",
-    "sqlmap": "pip install sqlmap",
-    "hydra": "winget install --id Thc.Hydra -e --source winget",
+    "nmap": ["winget", "install", "--id", "Insecure.Nmap", "-e", "--source", "winget"],
+    "curl": ["winget", "install", "--id", "cURL.cURL", "-e", "--source", "winget"],
+    "wget": ["winget", "install", "--id", "GNU.Wget2", "-e", "--source", "winget"],
+    "ping": ["cmd", "/c", "echo", "ya instalado en Windows"],
+    "tracert": ["cmd", "/c", "echo", "ya instalado en Windows"],
+    "netstat": ["cmd", "/c", "echo", "ya instalado en Windows"],
+    "ipconfig": ["cmd", "/c", "echo", "ya instalado en Windows"],
+    "findstr": ["cmd", "/c", "echo", "ya instalado en Windows"],
+    "python": ["cmd", "/c", "echo", "ya instalado"],
+    "pip": ["cmd", "/c", "echo", "ya instalado"],
+    "ssh": ["winget", "install", "--id", "Microsoft.OpenSSH.Beta", "-e", "--source", "winget"],
+    "git": ["winget", "install", "--id", "Git.Git", "-e", "--source", "winget"],
+    "whois": ["winget", "install", "--id", "whois", "-e", "--source", "winget"],
+    "dig": ["winget", "install", "--id", "BIND.BIND", "-e", "--source", "winget"],
+    "nslookup": ["cmd", "/c", "echo", "ya instalado en Windows"],
+    "sqlmap": ["pip", "install", "sqlmap"],
+    "hydra": ["winget", "install", "--id", "Thc.Hydra", "-e", "--source", "winget"],
 }
 
 NOT_FOUND_PATTERNS = [
@@ -369,7 +382,7 @@ def _auto_install(tool: str) -> str:
         return f"No sé cómo instalar {tool}. Instalalo manualmente."
     try:
         log.info(f"Instalando {tool}...")
-        result = subprocess.run(installer, shell=True, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(installer, capture_output=True, text=True, timeout=120)
         if result.returncode == 0 or "instalado" in (result.stdout + result.stderr).lower():
             return f"✅ {tool} instalado correctamente."
         else:
@@ -381,10 +394,11 @@ def _auto_install(tool: str) -> str:
 
 def execute_command(command: str, auto_install: bool = True) -> dict:
     tool = _get_tool_name(command)
+    args = _safe_args(command)
     for attempt in range(2):
         try:
             result = subprocess.run(
-                command, shell=True, capture_output=True, text=True, timeout=TOOL_TIMEOUT
+                args, capture_output=True, text=True, timeout=TOOL_TIMEOUT
             )
             output = (result.stdout or result.stderr or "").strip()
             if result.returncode != 0 and auto_install and attempt == 0:
@@ -441,7 +455,7 @@ def _load_tareas():
     if TAREAS_FILE.exists():
         try:
             TAREAS_DB = json.loads(TAREAS_FILE.read_text())
-        except:
+        except (json.JSONDecodeError, FileNotFoundError):
             TAREAS_DB = {}
     return TAREAS_DB
 
@@ -487,7 +501,7 @@ def _parse_edit_arg(arg: str) -> dict:
         if len(parts) >= 3:
             return {"path": parts[0], "old": parts[1].strip('"'), "new": " ".join(p.strip('"') for p in parts[2:])}
         return None
-    except:
+    except ValueError:
         return None
 
 TOOL_HANDLERS = {
@@ -704,13 +718,18 @@ def chat_stream(req: ChatRequest, authorization: str = Header(None)):
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...), authorization: str = Header(None)):
     verify_token(authorization)
-    file_id = str(uuid.uuid4())[:8]
-    ext = Path(file.filename).suffix if file.filename else ""
-    safe_name = f"{file_id}{ext}"
-    save_path = UPLOAD_DIR / safe_name
+
+    ext = Path(file.filename).suffix.lower() if file.filename else ""
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(400, f"Tipo de archivo no permitido: {ext}")
 
     content = await file.read()
-    save_path.write_bytes(content)
+    if len(content) > MAX_UPLOAD_SIZE:
+        raise HTTPException(413, f"Archivo demasiado grande ({len(content)}b). Máximo: {MAX_UPLOAD_SIZE}b")
+
+    file_id = str(uuid.uuid4())[:8]
+    safe_name = f"{file_id}{ext}"
+    save_path = UPLOAD_DIR / safe_name
 
     with db() as conn:
         conn.execute(
@@ -875,7 +894,7 @@ async def tool_grep(data: dict = Body({}), authorization: str = Header(None)):
                     for i, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
                         if re.search(pattern, line, re.IGNORECASE):
                             results.append({"file": str(p), "line": i, "text": line[:200]})
-                except:
+                except (UnicodeDecodeError, PermissionError, OSError):
                     pass
         return {"matches": len(results), "results": results[:100]}
     except Exception as e:

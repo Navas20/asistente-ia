@@ -299,8 +299,13 @@ def main():
                     cmd = msg.split(" ", 1)[1].strip()
                     screen.log(f"  {T.BORDER}┃{T.RESET} {T.YELLOW}⚙ {cmd}{T.RESET}")
                     try:
+                        import shlex
+                        try:
+                            cmd_args = shlex.split(cmd, posix=False)
+                        except:
+                            cmd_args = cmd.split()
                         result = subprocess.run(
-                            cmd, shell=True, capture_output=True, text=True, timeout=30
+                            cmd_args, capture_output=True, text=True, timeout=30
                         )
                         out = (result.stdout or "") + (result.stderr or "")
                         for line in out.split("\n")[:10]:

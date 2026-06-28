@@ -33,7 +33,7 @@ def fallback_tts(text: str):
         engine.runAndWait()
     except ImportError:
         pass
-    except:
+    except Exception:
         pass
 
 # ─── Speech-to-Text ───

@@ -1,7 +1,8 @@
 import os
-import subprocess
 import re
+import shlex
 import shutil
+import subprocess
 from datetime import datetime
 
 TOOL_TIMEOUT = int(os.getenv("TOOL_TIMEOUT", "120"))
@@ -9,30 +10,34 @@ TOOL_TIMEOUT = int(os.getenv("TOOL_TIMEOUT", "120"))
 def tool_exists(name: str) -> bool:
     return shutil.which(name) is not None
 
-def run(cmd: str, timeout: int = None) -> dict:
+def run(cmd, timeout: int = None) -> dict:
+    if isinstance(cmd, str):
+        try:
+            cmd = shlex.split(cmd, posix=False)
+        except:
+            cmd = cmd.split()
     try:
         result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True,
+            cmd, capture_output=True, text=True,
             timeout=timeout or TOOL_TIMEOUT
         )
         output = (result.stdout or result.stderr or "(sin salida)")[:5000]
         return {
-            "command": cmd,
+            "command": " ".join(cmd) if isinstance(cmd, list) else cmd,
             "success": result.returncode == 0,
             "output": output,
             "returncode": result.returncode
         }
     except subprocess.TimeoutExpired:
-        return {"command": cmd, "success": False, "output": "[Timeout]"}
+        return {"command": " ".join(cmd) if isinstance(cmd, list) else cmd, "success": False, "output": "[Timeout]"}
     except Exception as e:
-        return {"command": cmd, "success": False, "output": f"[Error: {e}]"}
+        return {"command": " ".join(cmd) if isinstance(cmd, list) else cmd, "success": False, "output": f"[Error: {e}]"}
 
-def try_run(tool: str, args: str, fallback_msg: str = None) -> dict:
-    """Ejecuta una herramienta solo si existe, sino devuelve mensaje."""
+def try_run(tool: str, args: list, fallback_msg: str = None) -> dict:
     if tool_exists(tool):
-        return run(f"{tool} {args}")
+        return run([tool] + args)
     return {
-        "command": f"{tool} {args}",
+        "command": f"{tool} {' '.join(args)}",
         "success": False,
         "output": fallback_msg or f"[{tool} no instalado]"
     }
@@ -88,42 +93,42 @@ def ejecutar_workflow(nombre: str, params: dict) -> dict:
 
     if nombre == "full_recon":
         resultados = [
-            try_run("whois", target, "whois no disponible"),
-            try_run("nmap", f"-sV -sC -T4 {target}", "nmap no instalado"),
-            try_run("nslookup", target, "nslookup no disponible"),
+            try_run("whois", [target], "whois no disponible"),
+            try_run("nmap", ["-sV", "-sC", "-T4", target], "nmap no instalado"),
+            try_run("nslookup", [target], "nslookup no disponible"),
         ]
         if not re.match(r'^\d+\.\d+\.\d+\.\d+$', target):
             resultados.append(
-                try_run("gobuster", f"dir -u http://{target} -w /usr/share/wordlists/dirb/common.txt -q -t 10",
+                try_run("gobuster", ["dir", "-u", f"http://{target}", "-w", "/usr/share/wordlists/dirb/common.txt", "-q", "-t", "10"],
                         "gobuster no instalado (sudo apt install gobuster)")
             )
 
     elif nombre == "web_audit":
         resultados = [
-            run(f"curl -sI {target} 2>/dev/null | head -30 || echo 'curl no disponible'"),
-            try_run("whatweb", target, "whatweb no instalado"),
-            try_run("nikto", f"-h {target} -Tuning 123456 -q", "nikto no instalado"),
-            try_run("gobuster", f"dir -u {target} -w /usr/share/wordlists/dirb/common.txt -q -t 10",
+            run(["curl", "-sI", target]),
+            try_run("whatweb", [target], "whatweb no instalado"),
+            try_run("nikto", ["-h", target, "-Tuning", "123456", "-q"], "nikto no instalado"),
+            try_run("gobuster", ["dir", "-u", target, "-w", "/usr/share/wordlists/dirb/common.txt", "-q", "-t", "10"],
                     "gobuster no instalado"),
         ]
 
     elif nombre == "exploit_suggest":
         resultados = [
-            try_run("searchsploit", target, "searchsploit no instalado (parte de exploitdb)"),
-            run(f"curl -s 'https://cve.circl.lu/api/cvefor/{target}' 2>/dev/null | head -200 || echo 'API CVE no responde'"),
+            try_run("searchsploit", [target], "searchsploit no instalado (parte de exploitdb)"),
+            run(["curl", "-s", f"https://cve.circl.lu/api/cvefor/{target}"]),
         ]
 
     elif nombre == "network_scan":
         resultados = [
-            try_run("nmap", f"-sn {target}", "nmap no instalado"),
-            try_run("nmap", f"-sV -T4 {target}", "nmap no instalado"),
+            try_run("nmap", ["-sn", target], "nmap no instalado"),
+            try_run("nmap", ["-sV", "-T4", target], "nmap no instalado"),
         ]
 
     elif nombre == "password_audit":
         resultados = [
-            run("echo '--- Auditoría de contraseñas ---'"),
-            try_run("hashid", target, "hashid no instalado") if target else run("echo '(sin hash para analizar)'"),
-            run("echo 'Defensa recomendada: gestor de contraseñas + 2FA + MFA'"),
+            run(["cmd", "/c", "echo --- Auditoria de contrasenas ---"]),
+            try_run("hashid", [target], "hashid no instalado") if target else run(["cmd", "/c", "echo (sin hash para analizar)"]),
+            run(["cmd", "/c", "echo Defensa recomendada: gestor de contrasenas + 2FA + MFA"]),
         ]
 
     reporte = [
