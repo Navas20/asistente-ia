@@ -1,0 +1,16 @@
+[Unit]
+Description=Asistente Personal Telegram Bot
+After=network.target asistente.service
+Requires=asistente.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/asistente-ia/backend
+EnvironmentFile=/home/ubuntu/asistente-ia/backend/.env.telegram
+ExecStart=/usr/bin/python3 /home/ubuntu/asistente-ia/backend/telegram_bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

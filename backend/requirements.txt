@@ -1,0 +1,21 @@
+# Core
+fastapi==0.115.6
+uvicorn==0.34.0
+httpx==0.28.1
+python-multipart==0.0.19
+aiofiles==24.1.0
+
+# Telegram
+python-telegram-bot==21.9
+
+# Web search
+duckduckgo_search==7.5.0
+
+# Voice (opcional — instalar solo si se necesita):
+# edge-tts==7.0.0
+# vosk==0.3.45
+# SpeechRecognition==3.11.0
+# PyAudio==0.2.14
+# pyttsx3==2.98
+
+# Tool execution (nmap, etc.) se maneja via sistema, no pip

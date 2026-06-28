@@ -1,0 +1,15 @@
+[Unit]
+Description=Asistente Personal API
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/asistente-ia/backend
+EnvironmentFile=/home/ubuntu/asistente-ia/backend/.env
+ExecStart=/usr/bin/python3 /home/ubuntu/asistente-ia/backend/main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

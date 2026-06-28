@@ -1,0 +1,59 @@
+version: "3.9"
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    restart: unless-stopped
+    command: serve
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  jarvis:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - AUTH_TOKEN=${AUTH_TOKEN:-cambia-este-token-urgentemente}
+      - MODEL_NAME=personal
+      - OLLAMA_URL=http://ollama:11434
+      - DB_PATH=/data/conversations.db
+      - UPLOAD_DIR=/data/uploads
+    volumes:
+      - jarvis_data:/data
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  telegram-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python3 /app/telegram_bot.py
+    environment:
+      - API_URL=http://jarvis:8000
+      - AUTH_TOKEN=${AUTH_TOKEN:-cambia-este-token-urgentemente}
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - ALLOWED_USER_ID=${ALLOWED_USER_ID}
+    depends_on:
+      jarvis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
+  jarvis_data:
