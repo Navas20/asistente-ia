@@ -223,8 +223,8 @@ def main():
                 if action_type == "exit":
                     break
 
-            if action_type == "submit":
-                cmd_lower = msg.lower()
+                if action_type == "submit":
+                    cmd_lower = msg.lower()
 
                 # ── Commands ──
                 if cmd_lower in ("/salir", "salir", "exit", "quit"):
