@@ -1,11 +1,9 @@
 import os
 import sys
-import re
 import json
 import time
-import shutil
+import queue
 import httpx
-import readline
 import tempfile
 import subprocess
 import threading
@@ -13,499 +11,51 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-# ═══════════════════════════════════════════════════════════════
-#  ARTENISA SHELL v4.0 — OpenCode-style TUI + Gengar Theme
-# ═══════════════════════════════════════════════════════════════
+from display import Screen, Theme, truncate_ansi, visible_len
+
+T = Theme()
 
 API_URL = os.getenv("API_URL", "http://localhost:8000")
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "test-token")
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    try:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.GetStdHandle(-11)
-        mode = ctypes.c_uint32()
-        kernel32.GetConsoleMode(handle, ctypes.byref(mode))
-        kernel32.SetConsoleMode(handle, mode.value | 0x0004)
-    except:
-        pass
 
-# ─── State ───
 conv_id = None
 voice_mode = False
 current_model = "personal"
 session_start = time.time()
 session_tokens = 0
-session_cost = 0.0
 messages_history = []
-stdout_lock = threading.Lock()
-
-# ═══════════════════════════════════════════════════════════════
-#  GENGAR THEME (paleta de colores)
-# ═══════════════════════════════════════════════════════════════
-
-class Theme:
-    # Backgrounds
-    BG = "\033[48;5;234m"           # ~#1c1c1c dark
-    BG_PANEL = "\033[48;5;236m"     # ~#303030 panel
-    BG_ELEMENT = "\033[48;5;238m"   # ~#444444 input
-    BG_STATUS = "\033[48;5;53m"     # ~#5f005f purple dark
-
-    # Foregrounds
-    TEXT = "\033[38;5;252m"         # ~#d0d0d0 primary text
-    MUTED = "\033[38;5;245m"        # ~#8a8a8a muted
-    DIM = "\033[38;5;240m"          # ~#585858 dim
-
-    # Accents — Gengar palette
-    PURPLE = "\033[38;5;141m"       # #af87ff bright purple
-    PURPLE_DIM = "\033[38;5;98m"    # #875faf dim purple
-    RED = "\033[38;5;203m"          # #ff5f5f Gengar red eyes
-    RED_DIM = "\033[38;5;131m"      # #af5f5f dim red
-    PINK = "\033[38;5;213m"         # #ff87af pink accent
-    GREEN = "\033[38;5;114m"        # #87d787 soft green
-    YELLOW = "\033[38;5;221m"       # #ffd787 warm yellow
-    CYAN = "\033[38;5;117m"         # #87d7d7 cyan
-
-    # Semantic
-    SUCCESS = "\033[38;5;114m"
-    WARNING = "\033[38;5;221m"
-    ERROR = "\033[38;5;203m"
-    HIGHLIGHT = "\033[38;5;141m"
-
-    # Decorators
-    BORDER = "\033[38;5;98m"        # dim purple border
-    BORDER_ACTIVE = "\033[38;5;141m"  # bright purple active border
-
-    # Modifiers
-    BOLD = "\033[1m"
-    ITALIC = "\033[3m"
-    RESET = "\033[0m"
-    UNDERLINE = "\033[4m"
-    WHITE = "\033[97m"
-
-T = Theme
-
-# ═══════════════════════════════════════════════════════════════
-#  UTILITIES
-# ═══════════════════════════════════════════════════════════════
-
-def visible_len(s):
-    return len(re.sub(r"\033\[[0-9;]*m", "", s))
-
-def pad_vis(s, width):
-    diff = width - visible_len(s)
-    return s + (" " * max(0, diff))
-
-def get_tw():
-    return shutil.get_terminal_size().columns
-
-def get_th():
-    return shutil.get_terminal_size().lines
 
 def elapsed_str():
-    elapsed = int(time.time() - session_start)
-    m, s = divmod(elapsed, 60)
-    h, m = divmod(m, 60)
-    if h > 0:
-        return f"{h}h{m:02d}m{s:02d}s"
-    return f"{m}m{s:02d}s"
+    t = int(time.time() - session_start)
+    if t < 60:
+        return f"{t}s"
+    return f"{t // 60}m{t % 60:02d}s"
 
-# ═══════════════════════════════════════════════════════════════
-#  GENGAR ASCII ART (pequeño)
-# ═══════════════════════════════════════════════════════════════
-
-GENGAR_SMALL = [
-    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⡷⣦⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⡇⠈⠙⢷⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡇⠀⠀⠀⠙⢷⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣧⠀⠀⠀⠀⠀⠙⢷⣄⠀⠀⠀⢀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠀⠀⠀⠀⠀⠀⠀⠘⠳⣄⠀⣼⢷⣄⠀⣰⡀⠀⠀⠀⢀⣀⣤⡴⠶⠛⣿⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⢀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠳⣿⣀⣙⢷⡏⢻⣤⠶⠟⠛⠉⠀⠀⢀⣼⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⢠⡄⣿⠳⣤⣀⠀⠀⠀⠀⠀⢸⡆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠁⠀⠀⠀⠀⠁⠀⠀⠀⠀⠀⢀⣾⣡⣤⣤⣴⡆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⣿⡿⠿⠇⠀⠛⠿⣤⣀⠀⠀⢸⡇⠀⠀⠀⢀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠃⠀⠀⣸⠟⠀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⠀{T.RESET}",
-    f"{T.PURPLE}⢙⣿⡆⠀⠀⠀⠀⠀⠙⠳⢦⣸⡇⢀⡤⠖⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠉⠉⠉⠉⠙⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⣩⣿⠃{T.RESET}",
-    f"{T.PURPLE}⠸⠿⣭⡄⠀⠀⠀⠀⠀⠀⠀⢹⡷⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⡾⠋⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠈⢿⡄⠀⠀⠀⠀⠀⠀⠉⠀⠀⠀⠀⠀⣴⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣠⠞⠋⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⠀⢻⡄⠀⠀⢀⠀⠀⠀⠀⠀⠀⠀⢀⡼⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣠⡾⠟⠁⠀⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⠀⠀⠻⣄⢠⠏⠀⠀⠀⠀⠀⠀⣰⡏⠀⢻⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣠⡾⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⣹⠏⠀⠀⠀⢠⠀⠀⠀⡟⠀⠀⠘⣷⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣤⠾⠆⠀⠀⠀⠀⢶⢀⣴⠟⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⠀⠀⢠⡏⠀⠀⠀⠀⢸⣇⠀⠠⣷⡀⠀⠀⣿⣆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⡴⠞⠉⣿⠀⠀⠀⠀⠀⠀⢸⣏⣁⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⠀⠀⣼⠀⠀⠀⠀⠀⢸⡿⣦⡀⠈⠳⢦⣀⣀⣹⡄⠀⠀⠀⠀⠀⠀⠀⣀⣴⠛⠉⠀⠀⢀⡏⠀⠀⠀⠀⠀⠀⣸⠉⠉⠉⠉⠉⠙⠛⠛⠓⢶⣶⣤⡀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⠀⠀⣿⠀⠀⠀⠀⠀⣸⡇⠈⢷⣄⠀⠀⠀⠉⠉⠉⠀⠀⠀⠀⣠⣴⠛⠉⠏⠀⠀⠀⢀⡾⠁⠀⠀⠀⠀⠀⠐⣾⠃⠀⠀⠀⠀⠀⠀⠀⠀⠈⠛⢷⣾⡄⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⠀⢀⣿⠀⠀⠀⠀⠀⠹⣷⠀⣸⠋⠛⢦⣄⡀⠀⠀⠀⠀⠀⠀⠀⠈⠛⠶⠦⠤⠤⠞⠋⠀⢀⣤⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡀⣾⠛⠉⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⠀⠀⣿⠀⠀⠀⠀⠀⠀⠹⣿⡟⠀⠀⠀⢨⡏⠛⠲⠤⣤⣀⣀⡀⠀⠀⠀⠀⠀⢀⣀⣤⡶⠋⠀⠀⠀⠀⠀⡀⠀⠀⠀⠀⠀⣀⣤⡶⠞⠋⠛⠛⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⠀⢀⣿⡀⠀⠀⠀⠀⠀⠀⠈⠻⣄⡀⠀⣾⠀⠀⠀⠀⠀⠈⢹⡏⠉⠛⠛⠛⡿⠉⣍⡾⠁⠀⠀⠀⠀⠀⢀⣏⣀⣤⡴⠶⠛⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⢀⡾⠉⣧⠀⠀⠀⠀⠀⠀⠀⠀⠈⠛⢦⣇⡀⠀⠀⠀⠀⠀⣾⠀⠀⠀⠀⢸⢇⡴⠋⠀⠀⠀⠀⠀⠀⠀⣾⠋⠉⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⣸⠇⠀⠹⡆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠉⠓⠶⠤⣤⣴⣧⣠⣤⣤⠴⠟⠉⠀⠀⠀⠀⠀⠀⠀⠀⣼⠏⠂⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⣿⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣼⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⢹⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⣶⡄⣾⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⠀⢻⣦⠀⠀⠀⠀⠻⣆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢻⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⠀⠀⠙⠻⣦⡄⠀⢀⣈⣳⣤⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⠈⠘⢷⣽⣭⣿⣾⡎⠙⠷⣤⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠙⠟⠀⠁⠀⠀⠀⠉⠻⣗⠲⠶⠴⢦⡶⠶⣦⡀⠀⠀⢀⡀⠀⣀⠀⠀⠀⣠⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠳⣦⣠⡿⠀⠀⠘⣷⡀⢠⠟⢳⠟⢹⡧⣦⣠⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠀⠀⠀⠀⠘⣷⡿⠀⠀⠀⠀⣸⡿⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⠳⠦⠤⠴⠞⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
-    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⣀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
-]
-
-# ═══════════════════════════════════════════════════════════════
-#  LAYOUT COMPONENTS (OpenCode style)
-# ═══════════════════════════════════════════════════════════════
-
-def print_left_border(text, color=T.BORDER, width=None):
-    """Imprime texto con borde izquierdo estilo OpenCode (┃)."""
-    tw = width or get_tw() - 4
-    print(f"  {color}┃{T.RESET} {text}")
-
-def print_separator(title="", color=T.BORDER):
-    """Línea separadora horizontal con título opcional."""
-    tw = get_tw()
-    if title:
-        sep_len = (tw - len(title) - 6) // 2
-        left = "─" * sep_len
-        right = "─" * (tw - len(title) - 6 - sep_len)
-        print(f"  {color}{left} {T.TEXT}{title} {color}{right}{T.RESET}")
-    else:
-        print(f"  {color}{'─' * (tw - 4)}{T.RESET}")
-
-def print_empty_lines(n=1):
-    for _ in range(n):
-        print()
-
-def clear_screen():
-    os.system('cls' if os.name == 'nt' else 'clear')
-
-# ═══════════════════════════════════════════════════════════════
-#  HOME SCREEN (OpenCode style — vertically centered)
-# ═══════════════════════════════════════════════════════════════
-
-def print_home_screen():
-    clear_screen()
-    tw = get_tw()
-    th = get_th()
-
-    # Calcular espacio para centrar
-    content_height = len(GENGAR_SMALL) + 8  # logo + text + prompt
-    top_pad = max(3, (th - content_height) // 2 - 2)
-
-    # Top spacer
-    for _ in range(top_pad):
-        print()
-
-    # ─── Gengar ASCII Art (centrado) ───
-    max_art_w = max(visible_len(l) for l in GENGAR_SMALL)
-    for line in GENGAR_SMALL:
-        pad_left = max(1, (tw - max_art_w) // 2)
-        print(" " * pad_left + line)
-
-    print_empty_lines(1)
-
-    # ─── Title ───
-    title = f"{T.BOLD}{T.PURPLE}Artenisa{T.RESET}"
-    subtitle = f"{T.MUTED}v4.0 · Gengar Theme{T.RESET}"
-    print_centered(title, tw)
-    print_centered(subtitle, tw)
-
-    print_empty_lines(2)
-
-    # ─── Keyboard hints ───
-    hints = f"{T.DIM}/ayuda comandos  ·  Tab autocompletar  ·  Ctrl+C salir{T.RESET}"
-    print_centered(hints, tw)
-
-    print_empty_lines(1)
-
-def print_centered(text, tw=None):
-    tw = tw or get_tw()
-    vlen = visible_len(text)
-    pad_left = max(1, (tw - vlen) // 2)
-    print(" " * pad_left + text)
-
-# ═══════════════════════════════════════════════════════════════
-#  STATUS BAR (OpenCode style — bottom bar)
-# ═══════════════════════════════════════════════════════════════
-
-def print_status_bar(spinner_frame=""):
-    tw = get_tw()
-
-    # ─── Left: Mode label ───
-    mode_label = " ARtenisa "
-    mode_str = f"{T.BG_STATUS}{T.BOLD}{T.WHITE}{mode_label}{T.RESET}"
-
-    # ─── Center: Status/spinner ───
-    if spinner_frame:
-        status_str = f" {spinner_frame} {T.MUTED}thinking...{T.RESET}"
-    else:
-        status_str = f" {T.DIM}·{T.RESET} "
-
-    # ─── Right: Model + Tokens + Time ───
-    model_str = f"{T.TEXT}{current_model}{T.RESET}"
-    tokens_str = f"{T.MUTED}{session_tokens} tok{T.RESET}"
-    time_str = f"{T.MUTED}{elapsed_str()}{T.RESET}"
-
-    # ─── Far right: Keyboard hints ───
-    hints_str = f"{T.DIM}Ctrl+X cmd{T.RESET}"
-
-    # Build status bar
-    # Calculate widths
-    left_w = visible_len(mode_label) + 4
-    model_w = visible_len(current_model) + 6
-    tokens_w = len(str(session_tokens)) + 8
-    time_w = len(elapsed_str()) + 3
-    hints_w = 14
-    dots_w = 1
-
-    center_w = max(2, tw - left_w - model_w - tokens_w - time_w - hints_w - 6)
-
-    bar = f"\r{mode_str}"
-    bar += f" {T.BORDER}│{T.RESET}"
-    bar += f" {spinner_frame} " if spinner_frame else f" {T.MUTED}·{T.RESET} "
-    bar += f"{' ' * max(0, center_w - 10)}"
-    bar += f"{model_str} {T.DIM}·{T.RESET} "
-    bar += f"{tokens_str} {T.DIM}·{T.RESET} "
-    bar += f"{time_str}"
-    bar += f" {T.DIM}·{T.RESET} "
-    bar += f"{hints_str}"
-
-    # Pad to fill width
-    current_len = visible_len(bar.replace("\r", ""))
-    remaining = max(0, tw - current_len)
-    bar += " " * remaining
-
-    sys.stdout.write(bar)
-    sys.stdout.flush()
-
-def clear_status_bar():
-    tw = get_tw()
-    sys.stdout.write("\r" + " " * tw + "\r")
-    sys.stdout.flush()
-
-# ═══════════════════════════════════════════════════════════════
-#  MESSAGE RENDERING (OpenCode style with left borders)
-# ═══════════════════════════════════════════════════════════════
-
-def render_user_message(text):
-    """Renderiza mensaje del usuario con borde izquierdo estilo OpenCode."""
-    tw = get_tw()
-    msg_w = tw - 6
-
-    # Left border with agent color
-    print(f"  {T.BORDER_ACTIVE}┃{T.RESET}")
-    # Wrap text manually
-    lines = text.split('\n')
-    for line in lines:
-        # Simple word wrap
-        while visible_len(line) > msg_w:
-            # Find last space before msg_w
-            cut = msg_w
-            while cut > 0 and line[cut] != ' ':
-                cut -= 1
-            if cut == 0:
-                cut = msg_w
-            print(f"  {T.BORDER_ACTIVE}┃{T.RESET} {T.TEXT}{line[:cut]}{T.RESET}")
-            line = line[cut:].lstrip()
-        print(f"  {T.BORDER_ACTIVE}┃{T.RESET} {T.TEXT}{line}{T.RESET}")
-
-def render_assistant_message(text, tool_executed=False, tool_cmd="", tool_output=""):
-    """Renderiza respuesta del asistente con borde izquierdo."""
-    tw = get_tw()
-    msg_w = tw - 6
-
-    print(f"  {T.PURPLE_DIM}┃{T.RESET}")
-
-    # Split by newlines and render
-    lines = text.split('\n')
-    in_code_block = False
-    for line in lines:
-        # Track code blocks
-        if line.strip().startswith('```'):
-            in_code_block = not in_code_block
-
-        # Word wrap
-        while visible_len(line) > msg_w:
-            cut = msg_w
-            while cut > 0 and line[cut] != ' ':
-                cut -= 1
-            if cut == 0:
-                cut = msg_w
-            prefix = f"  {T.PURPLE_DIM}┃{T.RESET} "
-            if in_code_block:
-                print(f"{prefix}{T.BG_PANEL}{T.GREEN}{line[:cut]}{T.RESET}")
-            else:
-                print(f"{prefix}{T.GREEN}{line[:cut]}{T.RESET}")
-            line = line[cut:].lstrip()
-
-        prefix = f"  {T.PURPLE_DIM}┃{T.RESET} "
-        if in_code_block:
-            print(f"{prefix}{T.BG_PANEL}{T.GREEN}{line}{T.RESET}")
-        elif line.strip().startswith('#'):
-            print(f"{prefix}{T.BOLD}{T.GREEN}{line}{T.RESET}")
-        elif line.strip().startswith('- ') or line.strip().startswith('* '):
-            print(f"{prefix}{T.GREEN}{line}{T.RESET}")
-        elif line.strip().startswith('>'):
-            print(f"{prefix}{T.DIM}{T.GREEN}{line}{T.RESET}")
-        else:
-            print(f"{prefix}{T.GREEN}{line}{T.RESET}")
-
-    # Tool output
-    if tool_executed and tool_cmd:
-        print(f"  {T.PURPLE_DIM}┃{T.RESET}")
-        print(f"  {T.PURPLE_DIM}┃{T.RESET} {T.YELLOW}⚙ {tool_cmd}{T.RESET}")
-        if tool_output:
-            for line in tool_output.split('\n')[:8]:
-                print(f"  {T.PURPLE_DIM}┃{T.RESET} {T.DIM}{line}{T.RESET}")
-
-    print(f"  {T.PURPLE_DIM}┃{T.RESET}")
-
-# ═══════════════════════════════════════════════════════════════
-#  SPINNER (OpenCode blocks style)
-# ═══════════════════════════════════════════════════════════════
-
-class Spinner:
-    FRAMES = ["█", "▓", "▒", "░", "▒", "▓"]
-    COLORS = [T.PURPLE, T.PURPLE_DIM, T.RED_DIM, T.RED, T.RED_DIM, T.PURPLE_DIM]
-
-    def __init__(self, text="thinking"):
-        self.text = text
-        self.running = False
-        self.thread = None
-        self.idx = 0
-
-    def start(self):
-        self.running = True
-        self.thread = threading.Thread(target=self._spin, daemon=True)
-        self.thread.start()
-
-    def _spin(self):
-        while self.running:
-            frame = self.FRAMES[self.idx % len(self.FRAMES)]
-            color = self.COLORS[self.idx % len(self.COLORS)]
-            with stdout_lock:
-                print_status_bar(f"{color}{frame}{T.RESET}")
-            time.sleep(0.08)
-            self.idx += 1
-
-    def stop(self):
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=0.5)
-        with stdout_lock:
-            clear_status_bar()
-
-# ═══════════════════════════════════════════════════════════════
-#  INPUT HANDLING (OpenCode style prompt)
-# ═══════════════════════════════════════════════════════════════
-
-def print_prompt_area():
-    """Renderiza el área de input estilo OpenCode."""
-    tw = get_tw()
-
-    # Top border
-    print(f"  {T.BORDER}╹{'─' * (tw - 5)}{T.RESET}")
-
-    # Input with left border
-    print(f"  {T.BORDER}┃{T.RESET} {T.BG_ELEMENT}{' ' * (tw - 7)}{T.RESET}")
-
-    # Agent/model line
-    agent_info = f"{T.HIGHLIGHT}{T.BOLD}Artenisa{T.RESET} {T.DIM}·{T.RESET} {T.TEXT}{current_model}{T.RESET} {T.DIM}·{T.RESET} {T.MUTED}local{T.RESET}"
-    print(f"  {T.BORDER}┃{T.RESET} {agent_info}")
-
-    # Bottom shadow
-    print(f"  {T.BORDER}╹{T.BG_ELEMENT}▀{'▀' * (tw - 7)}{T.RESET}")
-
-def read_input():
-    """Lee input del usuario."""
-    tw = get_tw()
-    prompt_text = f"{T.BORDER}┃{T.RESET} {T.TEXT}"
+def api_get(path):
     try:
-        msg = input(f"  {prompt_text}> {T.RESET}")
-        return msg
-    except (EOFError, KeyboardInterrupt):
-        return None
-
-# ═══════════════════════════════════════════════════════════════
-#  HTTP HELPERS
-# ═══════════════════════════════════════════════════════════════
-
-def api_get(path, params=None):
-    try:
-        with httpx.Client(timeout=30) as c:
-            resp = c.get(f"{API_URL}{path}", params=params,
-                         headers={"Authorization": f"Bearer {AUTH_TOKEN}"})
-            return resp.json() if resp.status_code == 200 else {"error": resp.text}
-    except Exception as e:
-        return {"error": str(e)}
-
-def api_post(path, data=None):
-    try:
-        with httpx.Client(timeout=120) as c:
-            resp = c.post(f"{API_URL}{path}", json=data,
-                          headers={"Authorization": f"Bearer {AUTH_TOKEN}"})
-            return resp.json() if resp.status_code == 200 else {"error": resp.text}
-    except Exception as e:
-        return {"error": str(e)}
-
-# ═══════════════════════════════════════════════════════════════
-#  STREAMING (OpenCode style — token by token)
-# ═══════════════════════════════════════════════════════════════
-
-def send_message_stream(msg):
-    global conv_id, session_tokens
-
-    payload = {"message": msg}
-    if conv_id:
-        payload["conversation_id"] = conv_id
-
-    full_response = []
-
-    try:
-        data_bytes = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            f"{API_URL}/chat/stream",
-            data=data_bytes,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {AUTH_TOKEN}"
-            },
-            method="POST"
+        r = httpx.get(
+            f"{API_URL}{path}",
+            headers={"Authorization": f"Bearer {AUTH_TOKEN}"},
+            timeout=10,
         )
-        resp = urllib.request.urlopen(req, timeout=120)
-
-        if resp.status != 200:
-            return {"error": f"HTTP {resp.status}"}
-
-        for raw_line in resp:
-            line = raw_line.decode("utf-8", errors="replace").strip()
-            if not line or not line.startswith("data: "):
-                continue
-            line = line[6:]
-            if not line.strip():
-                continue
-            try:
-                obj = json.loads(line)
-                if obj.get("type") == "token":
-                    token = obj["content"]
-                    full_response.append(token)
-                    with stdout_lock:
-                        sys.stdout.write(f"{T.GREEN}{token}{T.RESET}")
-                        sys.stdout.flush()
-                    session_tokens += 1
-                elif obj.get("type") == "done":
-                    conv_id = obj.get("conversation_id", conv_id)
-                    print()
-                    return obj
-                elif obj.get("type") == "error":
-                    return {"error": obj.get("error")}
-            except json.JSONDecodeError:
-                continue
-    except urllib.error.HTTPError as e:
-        return {"error": f"HTTP {e.code}"}
+        return r.json()
     except Exception as e:
         return {"error": str(e)}
 
-    return {"response": "".join(full_response), "conversation_id": conv_id}
+def api_post(path, payload):
+    try:
+        r = httpx.post(
+            f"{API_URL}{path}",
+            json=payload,
+            headers={"Authorization": f"Bearer {AUTH_TOKEN}"},
+            timeout=60,
+        )
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)}
 
 def send_message(msg):
     global conv_id
@@ -517,12 +67,115 @@ def send_message(msg):
         conv_id = data["conversation_id"]
     return data
 
-# ═══════════════════════════════════════════════════════════════
-#  COMMANDS
-# ═══════════════════════════════════════════════════════════════
+def send_message_stream(msg, token_callback=None):
+    global conv_id, session_tokens
+    payload = {"message": msg}
+    if conv_id:
+        payload["conversation_id"] = conv_id
+    try:
+        data_bytes = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{API_URL}/chat/stream",
+            data=data_bytes,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {AUTH_TOKEN}",
+            },
+            method="POST",
+        )
+        resp = urllib.request.urlopen(req, timeout=120)
+        if resp.status != 200:
+            return {"error": f"HTTP {resp.status}"}
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line or not line.startswith("data: "):
+                continue
+            line = line[6:]
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+                if obj.get("type") == "token":
+                    session_tokens += 1
+                    if token_callback:
+                        token_callback(obj["content"])
+                elif obj.get("type") == "done":
+                    conv_id = obj.get("conversation_id", conv_id)
+                    return obj
+                elif obj.get("type") == "error":
+                    return {"error": obj.get("error")}
+            except json.JSONDecodeError:
+                pass
+    except urllib.error.HTTPError as e:
+        return {"error": f"HTTP {e.code}"}
+    except Exception as e:
+        return {"error": str(e)}
+    return {"response": "", "conversation_id": conv_id}
+
+GENGAR_ART = """\
+          \033[38;5;141m⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⡷⣦⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⡇⠈⠙⢷⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡇⠀⠀⠀⠙⢷⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣧⠀⠀⠀⠀⠀⠙⢷⣄⠀⠀⠀⢀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠀⠀⠀⠀⠀⠀⠀⠘⠳⣄⠀⣼⢷⣄⠀⣰⡀⠀⠀⠀⢀⣀⣤⡴⠶⠛⣿⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⢀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠳⣿⣀⣙⢷⡏⢻⣤⠶⠟⠛⠉⠀⠀⢀⣼⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⢠⡄⣿⠳⣤⣀⠀⠀⠀⠀⠀⢸⡆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠁⠀⠀⠀⠀⠁⠀⠀⠀⠀⠀⢀⣾⣡⣤⣤⣴⡆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⣿⡿⠿⠇⠀⠛⠿⣤⣀⠀⠀⢸⡇⠀⠀⠀⢀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠃⠀⠀⣸⠟⠀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⠀\033[0m
+          \033[38;5;141m⢙⣿⡆⠀⠀⠀⠀⠀⠙⠳⢦⣸⡇⢀⡤⠖⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠉⠉⠉⠉⠙⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⣩⣿⠃\033[0m
+          \033[38;5;141m⠸⠿⣭⡄⠀⠀⠀⠀⠀⠀⢹⡷⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⡾⠋⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠈⢿⡄⠀⠀⠀⠀⠀⠀⠉⠀⠀⠀⠀⠀⣴⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣠⠞⠋⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⠀⢻⡄⠀⠀⢀⠀⠀⠀⠀⠀⠀⠀⢀⡼⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣠⡾⠟⠁⠀⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⠀⠀⠻⣄⢠⠏⠀⠀⠀⠀⠀⠀⣰⡏⠀⢻⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣠⡾⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⠀⠀⠀⣹⠏⠀⠀⠀⢠⠀⠀⠀⡟⠀⠀⠘⣷⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣤⠾⠆⠀⠀⠀⠀⢶⢀⣴⠟⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⠀⠀⢠⡏⠀⠀⠀⠀⢸⣇⠀⠠⣷⡀⠀⠀⣿⣆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⡴⠞⠉⣿⠀⠀⠀⠀⠀⠀⢸⣏⣁⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⠀⠀⣼⠀⠀⠀⠀⠀⢸⡿⣦⡀⠈⠳⢦⣀⣀⣹⡄⠀⠀⠀⠀⠀⠀⠀⣀⣴⠛⠉⠀⠀⢀⡏⠀⠀⠀⠀⠀⠀⣸⠉⠉⠉⠉⠉⠙⠛⠛⠓⢶⣶⣤⡀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⠀⠀⣿⠀⠀⠀⠀⠀⣸⡇⠈⢷⣄⠀⠀⠀⠉⠉⠉⠀⠀⠀⠀⣠⣴⠛⠉⠏⠀⠀⠀⢀⡾⠁⠀⠀⠀⠀⠀⠐⣾⠃⠀⠀⠀⠀⠀⠀⠀⠀⠈⠛⢷⣾⡄⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⠀⢀⣿⠀⠀⠀⠀⠀⠹⣷⠀⣸⠋⠛⢦⣄⡀⠀⠀⠀⠀⠀⠀⠀⠈⠛⠶⠦⠤⠤⠞⠋⠀⢀⣤⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡀⣾⠛⠉⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⠀⠀⣿⠀⠀⠀⠀⠀⠀⠹⣿⡟⠀⠀⠀⢨⡏⠛⠲⠤⣤⣀⣀⡀⠀⠀⠀⠀⠀⢀⣀⣤⡶⠋⠀⠀⠀⠀⠀⡀⠀⠀⠀⠀⠀⣀⣤⡶⠞⠋⠛⠛⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⠀⢀⣿⡀⠀⠀⠀⠀⠀⠀⠈⠻⣄⡀⠀⣾⠀⠀⠀⠀⠀⠈⢹⡏⠉⠛⠛⠛⡿⠉⣍⡾⠁⠀⠀⠀⠀⠀⢀⣏⣀⣤⡴⠶⠛⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⢀⡾⠉⣧⠀⠀⠀⠀⠀⠀⠀⠀⠈⠛⢦⣇⡀⠀⠀⠀⠀⠀⣾⠀⠀⠀⠀⢸⢇⡴⠋⠀⠀⠀⠀⠀⠀⠀⣾⠋⠉⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⣸⠇⠀⠹⡆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠉⠓⠶⠤⣤⣴⣧⣠⣤⣤⠴⠟⠉⠀⠀⠀⠀⠀⠀⠀⠀⣼⠏⠂⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⣿⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣼⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⢹⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⣶⡄⣾⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⠀⢻⣦⠀⠀⠀⠀⠻⣆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢻⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⠀⠀⠙⠻⣦⡄⠀⢀⣈⣳⣤⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⠀⠀⠀⠈⠘⢷⣽⣭⣿⣾⡎⠙⠷⣤⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠙⠟⠀⠁⠀⠀⠀⠉⠻⣗⠲⠶⠴⢦⡶⠶⣦⡀⠀⠀⢀⡀⠀⣀⠀⠀⠀⣠⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠳⣦⣠⡿⠀⠀⠘⣷⡀⢠⠟⢳⠟⢹⡧⣦⣠⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠀⠀⠀⠀⠘⣷⡿⠀⠀⠀⠀⣸⡿⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⠳⠦⠤⠴⠞⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\033[0m
+          \033[38;5;141m⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⣀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\033[0m"""
+
+def show_help(screen):
+    screen.log(f"  {T.BORDER}┃{T.RESET} {T.BOLD}COMANDOS{T.RESET}")
+    screen.log(f"  {T.BORDER}┃{T.RESET} {T.HIGHLIGHT}/ayuda{T.RESET}     {T.MUTED}Help{T.RESET}")
+    screen.log(f"  {T.BORDER}┃{T.RESET} {T.HIGHLIGHT}/nueva{T.RESET}     {T.MUTED}New conversation{T.RESET}")
+    screen.log(f"  {T.BORDER}┃{T.RESET} {T.HIGHLIGHT}/model <m>{T.RESET}  {T.MUTED}Switch model{T.RESET}")
+    screen.log(f"  {T.BORDER}┃{T.RESET} {T.HIGHLIGHT}/modelos{T.RESET}   {T.MUTED}List models{T.RESET}")
+    screen.log(f"  {T.BORDER}┃{T.RESET} {T.HIGHLIGHT}/memoria{T.RESET}   {T.MUTED}View memories{T.RESET}")
+    screen.log(f"  {T.BORDER}┃{T.RESET} {T.HIGHLIGHT}/olvidar{T.RESET}   {T.MUTED}Clear memories{T.RESET}")
+    screen.log(f"  {T.BORDER}┃{T.RESET} {T.HIGHLIGHT}/buscar{T.RESET}    {T.MUTED}Web search{T.RESET}")
+    screen.log(f"  {T.BORDER}┃{T.RESET} {T.HIGHLIGHT}/run{T.RESET}       {T.MUTED}Run command{T.RESET}")
+    screen.log(f"  {T.BORDER}┃{T.RESET} {T.HIGHLIGHT}/voz{T.RESET}       {T.MUTED}Toggle voice{T.RESET}")
+    screen.log(f"  {T.BORDER}┃{T.RESET} {T.HIGHLIGHT}/archivos{T.RESET}  {T.MUTED}Project files{T.RESET}")
+    screen.log(f"  {T.BORDER}┃{T.RESET} {T.HIGHLIGHT}/add <file>{T.RESET}{T.MUTED}Add file context{T.RESET}")
+    screen.log(f"  {T.BORDER}┃{T.RESET} {T.HIGHLIGHT}/tokens{T.RESET}    {T.MUTED}Token stats{T.RESET}")
+    screen.log(f"  {T.BORDER}┃{T.RESET} {T.HIGHLIGHT}/editor{T.RESET}    {T.MUTED}External editor{T.RESET}")
+    screen.log(f"  {T.BORDER}┃{T.RESET} {T.HIGHLIGHT}/multiline{T.RESET} {T.MUTED}Multi-line input{T.RESET}")
+    screen.log(f"  {T.BORDER}┃{T.RESET} {T.HIGHLIGHT}/status{T.RESET}    {T.MUTED}System status{T.RESET}")
+    screen.log(f"  {T.BORDER}┃{T.RESET} {T.HIGHLIGHT}/gengar{T.RESET}    {T.MUTED}Show Gengar{T.RESET}")
+    screen.log(f"  {T.BORDER}┃{T.RESET} {T.HIGHLIGHT}/tema{T.RESET}      {T.MUTED}Theme info{T.RESET}")
+    screen.log(f"  {T.BORDER}┃{T.RESET} {T.HIGHLIGHT}/guardar{T.RESET}   {T.MUTED}Save session{T.RESET}")
+    screen.log(f"  {T.BORDER}┃{T.RESET} {T.HIGHLIGHT}/cargar{T.RESET}    {T.MUTED}Load session{T.RESET}")
+    screen.log(f"  {T.BORDER}┃{T.RESET} {T.HIGHLIGHT}/sesiones{T.RESET}  {T.MUTED}List sessions{T.RESET}")
+    screen.log(f"  {T.BORDER}┃{T.RESET} {T.HIGHLIGHT}/salir{T.RESET}     {T.MUTED}Exit{T.RESET}")
+
+def show_gengar(screen):
+    for line in GENGAR_ART.split("\n"):
+        screen.log(f"  {T.BORDER}┃{T.RESET} {line}")
 
 COMMANDS = {
-    "/ayuda": "show this help",
+    "/ayuda": "show help",
     "/nueva": "new conversation",
     "/model": "switch model",
     "/modelos": "list models",
@@ -531,321 +184,319 @@ COMMANDS = {
     "/buscar": "web search",
     "/run": "execute command",
     "/voz": "toggle voice mode",
-    "/workflows": "list workflows",
-    "/wf": "run workflow",
-    "/archivos": "list files",
-    "/add": "add file to context",
-    "/tokens": "token usage",
+    "/archivos": "list project files",
+    "/add": "add file context",
+    "/tokens": "show token stats",
     "/editor": "open external editor",
-    "/multiline": "toggle multi-line",
+    "/multiline": "multi-line input mode",
     "/status": "system status",
-    "/gengar": "show splash",
-    "/tema": "color themes",
+    "/gengar": "display Gengar art",
+    "/tema": "theme info",
+    "/guardar": "save session",
+    "/cargar": "load session",
+    "/sesiones": "list sessions",
     "/salir": "exit",
 }
 
-def show_help():
-    print()
-    print_separator("COMANDOS")
-    for cmd, desc in sorted(COMMANDS.items()):
-        print_left_border(f"{T.HIGHLIGHT}{cmd:14s}{T.RESET} {T.MUTED}{desc}{T.RESET}")
-    print_separator()
-    print_left_border(f"{T.DIM}Multi-línea: Shift+Enter | Tab: autocomplete{T.RESET}")
-    print()
-
-# ═══════════════════════════════════════════════════════════════
-#  SESSION MANAGEMENT
-# ═══════════════════════════════════════════════════════════════
-
-SESSIONS_DIR = Path(__file__).parent.parent / "backend" / "data" / "sessions"
-
-def ensure_sessions_dir():
-    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-
-def save_session(name=None):
-    ensure_sessions_dir()
-    if not name:
-        name = f"session_{int(time.time())}"
-    data = {
-        "conversation_id": conv_id,
-        "model": current_model,
-        "tokens": session_tokens,
-        "start": session_start,
-        "saved_at": time.time()
-    }
-    (SESSIONS_DIR / f"{name}.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
-    print_left_border(f"{T.SUCCESS}Session saved: {name}{T.RESET}")
-
-def load_session(name):
-    global conv_id, current_model, session_tokens, session_start
-    ensure_sessions_dir()
-    path = SESSIONS_DIR / f"{name}.json"
-    if not path.exists():
-        print_left_border(f"{T.ERROR}Session not found: {name}{T.RESET}")
-        return
-    data = json.loads(path.read_text(encoding="utf-8"))
-    conv_id = data.get("conversation_id")
-    current_model = data.get("model", "personal")
-    session_tokens = data.get("tokens", 0)
-    session_start = time.time()
-    print_left_border(f"{T.SUCCESS}Session loaded: {name}{T.RESET}")
-
-def list_sessions():
-    ensure_sessions_dir()
-    sessions = sorted(SESSIONS_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)
-    if not sessions:
-        print_left_border(f"{T.MUTED}No saved sessions{T.RESET}")
-        return
-    print_separator("SESSIONS")
-    for s in sessions:
-        data = json.loads(s.read_text(encoding="utf-8"))
-        t = time.strftime("%Y-%m-%d %H:%M", time.localtime(data.get("saved_at", 0)))
-        conv = data.get("conversation_id", "?")[:8]
-        tokens = data.get("tokens", 0)
-        print_left_border(f"{T.HIGHLIGHT}{s.stem:20s}{T.RESET} {T.DIM}{t}{T.RESET} conv:{conv} {tokens}tok")
-    print_separator()
-    print_left_border(f"{T.DIM}/cargar <name>{T.RESET}")
-
-# ═══════════════════════════════════════════════════════════════
-#  MAIN LOOP
-# ═══════════════════════════════════════════════════════════════
-
 def main():
-    global conv_id, voice_mode, current_model, session_tokens
+    global conv_id, session_start, session_tokens, current_model, voice_mode
 
-    # Show home screen
-    print_home_screen()
+    with Screen(Theme()) as screen:
+        screen.set_status(f"{current_model} · 0 tok · {elapsed_str()}")
+        show_gengar(screen)
+        screen.log(f"  {T.BORDER}┃{T.RESET} {T.PURPLE}{T.BOLD}Artenisa v4.0{T.RESET} {T.MUTED}· Gengar Theme{T.RESET}")
+        screen.log(f"  {T.BORDER}┃{T.RESET} {T.DIM}/ayuda para comandos · Ctrl+C para salir{T.RESET}")
 
-    # Check server
-    info = api_get("/")
-    if "error" in info:
-        print_left_border(f"{T.ERROR}Server not available: {info['error']}{T.RESET}")
-        print_left_border(f"{T.DIM}Start backend: python main.py{T.RESET}")
-        return
+        while True:
+            if screen.check_resize():
+                screen.redraw()
 
-    while True:
-        try:
-            # Read input
-            msg = read_input()
-            if msg is None:
+            action = screen.handle_input()
+
+            if action is None:
+                time.sleep(0.01)
+                continue
+
+            action_type, msg = action
+
+            if action_type == "exit":
                 break
 
-            msg = msg.strip()
-            if not msg:
-                continue
+            if action_type == "submit":
+                cmd_lower = msg.lower()
 
-            # ─── Commands ───
-            cmd_lower = msg.lower()
+                # ── Commands ──
+                if cmd_lower in ("/salir", "salir", "exit", "quit"):
+                    break
 
-            if cmd_lower in ("/salir", "salir", "exit", "quit"):
-                break
+                if cmd_lower in ("/gengar", "gengar"):
+                    show_gengar(screen)
+                    screen.set_status(f"{current_model} · {session_tokens} tok · {elapsed_str()}")
+                    continue
 
-            if cmd_lower in ("/gengar", "gengar"):
-                clear_screen()
-                print_home_screen()
-                continue
+                if cmd_lower in ("/ayuda", "help", "/?"):
+                    show_help(screen)
+                    screen.set_status(f"{current_model} · {session_tokens} tok · {elapsed_str()}")
+                    continue
 
-            if cmd_lower in ("/ayuda", "help"):
-                show_help()
-                continue
+                if cmd_lower in ("/nueva", "new", "reset"):
+                    conv_id = None
+                    session_tokens = 0
+                    session_start = time.time()
+                    screen.conversation.clear()
+                    screen.log(f"  {T.BORDER}┃{T.RESET} {T.PURPLE}{T.BOLD}Artenisa v4.0{T.RESET} {T.MUTED}· Gengar Theme{T.RESET}")
+                    screen.log(f"  {T.BORDER}┃{T.RESET} {T.WARNING}New conversation{T.RESET}")
+                    screen.set_status(f"{current_model} · 0 tok · {elapsed_str()}")
+                    continue
 
-            if cmd_lower in ("/nueva", "new", "reset"):
-                conv_id = None
-                session_tokens = 0
-                print_left_border(f"{T.WARNING}New conversation{T.RESET}")
-                continue
-
-            if cmd_lower == "/modelos":
-                data = api_get("/models")
-                models = data.get("models", [])
-                if models:
-                    print_separator("MODELS")
-                    for m in models:
-                        marker = f" {T.SUCCESS}← current{T.RESET}" if m == current_model else ""
-                        print_left_border(f"  {T.HIGHLIGHT}{m}{T.RESET}{marker}")
-                    print_separator()
-                continue
-
-            if cmd_lower.startswith("/model "):
-                current_model = msg.split(" ", 1)[1].strip()
-                print_left_border(f"{T.SUCCESS}Model: {current_model}{T.RESET}")
-                continue
-
-            if cmd_lower == "/memoria":
-                mems = api_get("/memories").get("memories", {})
-                if mems:
-                    print_separator("MEMORIES")
-                    for k, v in sorted(mems.items()):
-                        print_left_border(f"{T.HIGHLIGHT}{k.replace('_',' ').title():20s}{T.RESET} {T.TEXT}{v}{T.RESET}")
-                    print_separator()
-                else:
-                    print_left_border(f"{T.MUTED}No memories stored{T.RESET}")
-                continue
-
-            if cmd_lower == "/olvidar":
-                mems = api_get("/memories").get("memories", {})
-                for k in mems:
-                    httpx.delete(f"{API_URL}/memories/{k}", headers={"Authorization": f"Bearer {AUTH_TOKEN}"})
-                print_left_border(f"{T.ERROR}Memories cleared{T.RESET}")
-                continue
-
-            if cmd_lower.startswith("/buscar "):
-                query = msg.split(" ", 1)[1]
-                print_left_border(f"{T.WARNING}Searching: {query}...{T.RESET}")
-                result = api_get("/search", {"query": query})
-                print_left_border(result.get("results", "No results"))
-                continue
-
-            if cmd_lower.startswith("/run "):
-                cmd = msg.split(" ", 1)[1]
-                print_left_border(f"{T.WARNING}Running: {cmd}{T.RESET}")
-                with httpx.Client(timeout=120) as c:
-                    resp = c.post(f"{API_URL}/execute", data={"command": cmd},
-                                  headers={"Authorization": f"Bearer {AUTH_TOKEN}"})
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        icon = f"{T.SUCCESS}✓{T.RESET}" if data.get("success") else f"{T.ERROR}✗{T.RESET}"
-                        print_left_border(f"{icon} exit:{data.get('returncode')}")
-                        for line in data.get("output", "").split('\n')[:20]:
-                            print_left_border(f"  {T.DIM}{line}{T.RESET}")
-                continue
-
-            if cmd_lower == "/workflows":
-                wfs = api_get("/workflows")
-                if isinstance(wfs, dict) and "error" not in wfs:
-                    print_separator("WORKFLOWS")
-                    for name, wf in wfs.items():
-                        print_left_border(f"{T.HIGHLIGHT}{name:20s}{T.RESET} {T.MUTED}{wf.get('description','')}{T.RESET}")
-                    print_separator()
-                continue
-
-            if cmd_lower.startswith("/wf "):
-                wf_name = msg.split(" ", 1)[1].strip()
-                print_left_border(f"{T.WARNING}Workflow: {wf_name}{T.RESET}")
-                result = api_post(f"/workflows/{wf_name}", {})
-                if "reporte" in result:
-                    for line in result["reporte"].split('\n'):
-                        print_left_border(f"  {T.TEXT}{line}{T.RESET}")
-                continue
-
-            if cmd_lower == "/archivos":
-                files = api_get("/files").get("files", [])
-                if files:
-                    print_separator("FILES")
-                    for f in files:
-                        print_left_border(f"{T.HIGHLIGHT}{f['id']}{T.RESET} {T.TEXT}{f['name']}{T.RESET} {T.DIM}{f['size']}b{T.RESET}")
-                    print_separator()
-                continue
-
-            if cmd_lower.startswith("/add "):
-                filepath = msg.split(" ", 1)[1].strip()
-                try:
-                    p = Path(filepath)
-                    if p.exists() and p.is_file():
-                        content = p.read_text(encoding="utf-8", errors="replace")[:8000]
-                        msg = f"[File: {filepath}]\n```\n{content}\n```"
+                if cmd_lower == "/modelos":
+                    data = api_get("/models")
+                    models = data.get("models", [])
+                    if models:
+                        screen.log(f"  {T.BORDER}┃{T.RESET} {T.BOLD}MODELS{T.RESET}")
+                        for m in models:
+                            marker = f" {T.SUCCESS}← current{T.RESET}" if m == current_model else ""
+                            screen.log(f"  {T.BORDER}┃{T.RESET}  {T.HIGHLIGHT}{m}{T.RESET}{marker}")
                     else:
-                        print_left_border(f"{T.ERROR}File not found: {filepath}{T.RESET}")
-                        continue
-                except Exception as e:
-                    print_left_border(f"{T.ERROR}Error: {e}{T.RESET}")
+                        screen.log(f"  {T.BORDER}┃{T.RESET} {T.MUTED}No models available{T.RESET}")
+                    screen.set_status(f"{current_model} · {session_tokens} tok · {elapsed_str()}")
                     continue
 
-            if cmd_lower == "/tokens":
-                print_separator("TOKEN USAGE")
-                print_left_border(f"  Tokens: {T.HIGHLIGHT}{session_tokens}{T.RESET}")
-                print_left_border(f"  Cost:   {T.HIGHLIGHT}local (free){T.RESET}")
-                print_left_border(f"  Time:   {T.HIGHLIGHT}{elapsed_str()}{T.RESET}")
-                print_left_border(f"  Model:  {T.HIGHLIGHT}{current_model}{T.RESET}")
-                print_separator()
-                continue
+                if cmd_lower.startswith("/model "):
+                    current_model = msg.split(" ", 1)[1].strip()
+                    screen.log(f"  {T.BORDER}┃{T.RESET} {T.SUCCESS}Model: {current_model}{T.RESET}")
+                    screen.set_status(f"{current_model} · {session_tokens} tok · {elapsed_str()}")
+                    continue
 
-            if cmd_lower.startswith("/guardar"):
-                parts = msg.split(" ", 1)
-                save_session(parts[1].strip() if len(parts) > 1 else None)
-                continue
+                if cmd_lower == "/memoria":
+                    mems = api_get("/memories").get("memories", {})
+                    if mems:
+                        screen.log(f"  {T.BORDER}┃{T.RESET} {T.BOLD}MEMORIES{T.RESET}")
+                        for k, v in sorted(mems.items()):
+                            label = k.replace("_", " ").title()
+                            screen.log(f"  {T.BORDER}┃{T.RESET} {T.HIGHLIGHT}{label:20s}{T.RESET} {T.TEXT}{v}{T.RESET}")
+                    else:
+                        screen.log(f"  {T.BORDER}┃{T.RESET} {T.MUTED}No memories stored{T.RESET}")
+                    screen.set_status(f"{current_model} · {session_tokens} tok · {elapsed_str()}")
+                    continue
 
-            if cmd_lower.startswith("/cargar "):
-                load_session(msg.split(" ", 1)[1].strip())
-                continue
+                if cmd_lower.startswith("/olvidar"):
+                    data = api_post("/memories/clear", {})
+                    screen.log(f"  {T.BORDER}┃{T.RESET} {T.WARNING}Memories cleared{T.RESET}")
+                    screen.set_status(f"{current_model} · {session_tokens} tok · {elapsed_str()}")
+                    continue
 
-            if cmd_lower == "/sesiones":
-                list_sessions()
-                continue
+                if cmd_lower.startswith("/buscar "):
+                    query = msg.split(" ", 1)[1].strip()
+                    screen.log(f"  {T.BORDER}┃{T.RESET} {T.YELLOW}🔍 Searching: {query}{T.RESET}")
+                    data = api_post("/web_search", {"query": query})
+                    result = data.get("result", data.get("response", "No results"))
+                    screen.log(f"  {T.BORDER}┃{T.RESET} {T.TEXT}{result}{T.RESET}")
+                    screen.set_status(f"{current_model} · {session_tokens} tok · {elapsed_str()}")
+                    continue
 
-            if cmd_lower == "/multiline":
-                print_left_border(f"{T.WARNING}Multi-line: use Shift+Enter or paste{T.RESET}")
-                continue
+                if cmd_lower.startswith("/run "):
+                    cmd = msg.split(" ", 1)[1].strip()
+                    screen.log(f"  {T.BORDER}┃{T.RESET} {T.YELLOW}⚙ {cmd}{T.RESET}")
+                    try:
+                        result = subprocess.run(
+                            cmd, shell=True, capture_output=True, text=True, timeout=30
+                        )
+                        out = (result.stdout or "") + (result.stderr or "")
+                        for line in out.split("\n")[:10]:
+                            if line.strip():
+                                screen.log(f"  {T.BORDER}┃{T.RESET} {T.DIM}{line}{T.RESET}")
+                        if result.returncode != 0:
+                            screen.log(f"  {T.BORDER}┃{T.RESET} {T.ERROR}Exit code: {result.returncode}{T.RESET}")
+                    except subprocess.TimeoutExpired:
+                        screen.log(f"  {T.BORDER}┃{T.RESET} {T.ERROR}Command timed out{T.RESET}")
+                    except Exception as e:
+                        screen.log(f"  {T.BORDER}┃{T.RESET} {T.ERROR}Error: {e}{T.RESET}")
+                    screen.set_status(f"{current_model} · {session_tokens} tok · {elapsed_str()}")
+                    continue
 
-            if cmd_lower == "/editor":
-                try:
-                    editor = os.environ.get("EDITOR", os.environ.get("VISUAL", "notepad"))
-                    tmp = Path(tempfile.gettempdir()) / f"artenisa_{os.urandom(4).hex()}.txt"
-                    tmp.write_text("", encoding="utf-8")
-                    subprocess.run([editor, str(tmp)], timeout=120)
-                    msg = tmp.read_text(encoding="utf-8").strip()
-                    tmp.unlink(missing_ok=True)
+                if cmd_lower == "/voz":
+                    voice_mode = not voice_mode
+                    status = "on" if voice_mode else "off"
+                    screen.log(f"  {T.BORDER}┃{T.RESET} {T.WARNING}Voice mode: {status}{T.RESET}")
+                    screen.set_status(f"{current_model} · {session_tokens} tok · {elapsed_str()}")
+                    continue
+
+                if cmd_lower == "/archivos":
+                    screen.log(f"  {T.BORDER}┃{T.RESET} {T.BOLD}PROJECT FILES{T.RESET}")
+                    try:
+                        cwd = Path.cwd()
+                        for f in sorted(cwd.iterdir()):
+                            if f.name.startswith(".") or f.name.startswith("__"):
+                                continue
+                            icon = "📁" if f.is_dir() else "📄"
+                            screen.log(f"  {T.BORDER}┃{T.RESET}  {icon} {T.TEXT}{f.name}{T.RESET}")
+                    except:
+                        pass
+                    screen.set_status(f"{current_model} · {session_tokens} tok · {elapsed_str()}")
+                    continue
+
+                if cmd_lower.startswith("/add "):
+                    fname = msg.split(" ", 1)[1].strip()
+                    try:
+                        content = Path(fname).read_text(encoding="utf-8", errors="replace")[:2000]
+                        messages_history.append({"role": "user", "content": f"File {fname}:\n{content}"})
+                        screen.log(f"  {T.BORDER}┃{T.RESET} {T.SUCCESS}Added: {fname}{T.RESET}")
+                    except Exception as e:
+                        screen.log(f"  {T.BORDER}┃{T.RESET} {T.ERROR}Error: {e}{T.RESET}")
+                    screen.set_status(f"{current_model} · {session_tokens} tok · {elapsed_str()}")
+                    continue
+
+                if cmd_lower == "/tokens":
+                    t = int(time.time() - session_start)
+                    screen.log(f"  {T.BORDER}┃{T.RESET} {T.BOLD}TOKEN STATS{T.RESET}")
+                    screen.log(f"  {T.BORDER}┃{T.RESET}  Tokens:  {T.HIGHLIGHT}{session_tokens}{T.RESET}")
+                    screen.log(f"  {T.BORDER}┃{T.RESET}  Time:    {T.HIGHLIGHT}{elapsed_str()}{T.RESET}")
+                    screen.log(f"  {T.BORDER}┃{T.RESET}  Cost:    {T.HIGHLIGHT}local (free){T.RESET}")
+                    screen.set_status(f"{current_model} · {session_tokens} tok · {elapsed_str()}")
+                    continue
+
+                if cmd_lower == "/editor":
+                    screen.stop()
+                    editor = os.environ.get("EDITOR", "notepad" if sys.platform == "win32" else "nano")
+                    tmp = tempfile.NamedTemporaryFile(
+                        mode="w", suffix=".md", delete=False, encoding="utf-8"
+                    )
+                    tmp.close()
+                    try:
+                        subprocess.run([editor, tmp.name])
+                        text = Path(tmp.name).read_text(encoding="utf-8").strip()
+                        if text:
+                            msg = text
+                            screen.start()
+                            screen.redraw()
+                        else:
+                            screen.start()
+                            screen.redraw()
+                            screen.log(f"  {T.BORDER}┃{T.RESET} {T.WARNING}Editor cancelled{T.RESET}")
+                            screen.set_status(f"{current_model} · {session_tokens} tok · {elapsed_str()}")
+                            continue
+                    except Exception as e:
+                        screen.start()
+                        screen.redraw()
+                        screen.log(f"  {T.BORDER}┃{T.RESET} {T.ERROR}Editor error: {e}{T.RESET}")
+                        screen.set_status(f"{current_model} · {session_tokens} tok · {elapsed_str()}")
+                        continue
+                    finally:
+                        try:
+                            Path(tmp.name).unlink()
+                        except:
+                            pass
+
+                if cmd_lower == "/multiline":
+                    screen.stop()
+                    print(f"  {T.BORDER}┃{T.RESET} {T.YELLOW}Multi-line mode (Ctrl+Z + Enter to finish):{T.RESET}")
+                    lines = []
+                    try:
+                        while True:
+                            line = input()
+                            lines.append(line)
+                    except EOFError:
+                        pass
+                    msg = "\n".join(lines).strip()
                     if not msg:
+                        screen.start()
+                        screen.redraw()
+                        screen.log(f"  {T.BORDER}┃{T.RESET} {T.WARNING}Cancelled{T.RESET}")
+                        screen.set_status(f"{current_model} · {session_tokens} tok · {elapsed_str()}")
                         continue
-                except Exception as e:
-                    print_left_border(f"{T.ERROR}Editor error: {e}{T.RESET}")
+                    screen.start()
+                    screen.redraw()
+
+                if cmd_lower == "/status":
+                    screen.log(f"  {T.BORDER}┃{T.RESET} {T.BOLD}SYSTEM STATUS{T.RESET}")
+                    screen.log(f"  {T.BORDER}┃{T.RESET}  API:     {T.SUCCESS}Online{T.RESET}")
+                    screen.log(f"  {T.BORDER}┃{T.RESET}  Model:   {T.HIGHLIGHT}{current_model}{T.RESET}")
+                    screen.log(f"  {T.BORDER}┃{T.RESET}  Tokens:  {T.HIGHLIGHT}{session_tokens}{T.RESET}")
+                    screen.log(f"  {T.BORDER}┃{T.RESET}  Time:    {T.HIGHLIGHT}{elapsed_str()}{T.RESET}")
+                    screen.log(f"  {T.BORDER}┃{T.RESET}  Conv:    {T.HIGHLIGHT}{'Active' if conv_id else 'New'}{T.RESET}")
+                    screen.set_status(f"{current_model} · {session_tokens} tok · {elapsed_str()}")
                     continue
 
-            if cmd_lower == "/status":
-                print_separator("SYSTEM STATUS")
-                print_left_border(f"  API:     {T.SUCCESS}Online{T.RESET}")
-                print_left_border(f"  Model:   {T.HIGHLIGHT}{current_model}{T.RESET}")
-                print_left_border(f"  Tokens:  {T.HIGHLIGHT}{session_tokens}{T.RESET}")
-                print_left_border(f"  Time:    {T.HIGHLIGHT}{elapsed_str()}{T.RESET}")
-                print_left_border(f"  Conv:    {T.HIGHLIGHT}{'Active' if conv_id else 'New'}{T.RESET}")
-                print_separator()
-                continue
+                if cmd_lower == "/tema":
+                    screen.log(f"  {T.BORDER}┃{T.RESET} {T.BOLD}THEMES{T.RESET}")
+                    screen.log(f"  {T.BORDER}┃{T.RESET}  {T.PURPLE}● Gengar{T.RESET} {T.MUTED}(current){T.RESET}")
+                    screen.log(f"  {T.BORDER}┃{T.RESET}  {T.DIM}More coming soon...{T.RESET}")
+                    screen.set_status(f"{current_model} · {session_tokens} tok · {elapsed_str()}")
+                    continue
 
-            if cmd_lower == "/tema":
-                print_separator("THEMES")
-                print_left_border(f"  {T.PURPLE}● Gengar{T.RESET} (current)")
-                print_left_border(f"  {T.DIM}More themes coming soon...{T.RESET}")
-                print_separator()
-                continue
+                # ── Send message ──
+                screen.log(f"  {T.BORDER}┃{T.RESET} {T.TEXT}{msg}{T.RESET}")
+                screen.log(f"  {T.BORDER}┃{T.RESET} {T.PURPLE}⏳{T.RESET} ")
 
-            # ─── Send message (with streaming) ───
-            render_user_message(msg)
-            print()
+                result_queue = queue.Queue()
 
-            spinner = Spinner("thinking")
-            spinner.start()
+                def on_token(tok):
+                    result_queue.put(("token", tok))
 
-            try:
-                data = send_message_stream(msg)
-                if "error" in data:
-                    spinner.stop()
-                    spinner.start()
-                    data = send_message(msg)
-            except Exception as e:
-                spinner.stop()
-                print_left_border(f"{T.ERROR}Error: {e}{T.RESET}")
-                continue
+                def stream_worker():
+                    try:
+                        data = send_message_stream(msg, token_callback=on_token)
+                        result_queue.put(("result", data))
+                    except Exception as e:
+                        result_queue.put(("result", {"error": str(e)}))
 
-            spinner.stop()
+                t = threading.Thread(target=stream_worker, daemon=True)
+                t.start()
 
-            if "error" in data:
-                print_left_border(f"{T.ERROR}{data['error']}{T.RESET}")
-                continue
+                current_line = f"  {T.BORDER}┃{T.RESET} {T.PURPLE}⏳{T.RESET} "
+                streaming = True
+                cancelled = False
 
-            resp = data.get("response", "")
-            tool_exec = data.get("tool_executed", False)
-            tool_cmd = data.get("tool_command", "")
-            tool_out = data.get("tool_output", "")
+                while streaming:
+                    if screen.check_resize():
+                        screen.redraw()
 
-            render_assistant_message(resp, tool_exec, tool_cmd, tool_out)
+                    try:
+                        item = result_queue.get(timeout=0.05)
+                        if item[0] == "token":
+                            current_line += f"{T.GREEN}{item[1]}{T.RESET}"
+                            screen.update_last(current_line)
+                            screen.set_status(
+                                f"{current_model} · {session_tokens} tok · {elapsed_str()}"
+                            )
+                        elif item[0] == "result":
+                            done_data = item[1]
+                            streaming = False
+                    except queue.Empty:
+                        pass
 
-        except (EOFError, KeyboardInterrupt):
-            break
+                    if screen.cancel_pressed():
+                        cancelled = True
+                        streaming = False
 
-    # Exit message
-    print()
-    print_left_border(f"{T.MUTED}Session ended · {session_tokens} tokens used{T.RESET}")
-    print()
+                if cancelled:
+                    screen.update_last(
+                        f"  {T.BORDER}┃{T.RESET} {T.WARNING}Cancelled.{T.RESET}"
+                    )
+                    screen.set_status(
+                        f"{current_model} · {session_tokens} tok · {elapsed_str()}"
+                    )
+                    continue
+
+                if done_data and "error" not in done_data:
+                    resp = done_data.get("response", "")
+                    tool_exec = done_data.get("tool_executed", False)
+                    tool_cmd = done_data.get("tool_command", "")
+                    tool_out = done_data.get("tool_output", "")
+
+                    if tool_exec and tool_cmd:
+                        screen.log(f"  {T.BORDER}┃{T.RESET} {T.YELLOW}⚙ {tool_cmd}{T.RESET}")
+                        if tool_out:
+                            for line in tool_out.split("\n")[:8]:
+                                if line.strip():
+                                    screen.log(f"  {T.BORDER}┃{T.RESET} {T.DIM}{line}{T.RESET}")
+                elif done_data and "error" in done_data:
+                    screen.log(f"  {T.BORDER}┃{T.RESET} {T.ERROR}{done_data['error']}{T.RESET}")
+
+                screen.set_status(
+                    f"{current_model} · {session_tokens} tok · {elapsed_str()}"
+                )
 
 if __name__ == "__main__":
     main()

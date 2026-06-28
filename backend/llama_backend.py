@@ -7,7 +7,8 @@ from typing import Generator
 
 log = logging.getLogger("artenisa.llama")
 
-LLAMA_SERVER_URL = os.getenv("LLAMA_SERVER_URL", "http://localhost:8080")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+MODEL_NAME = os.getenv("MODEL_NAME", "personal")
 
 _httpx_client = None
 
@@ -19,42 +20,49 @@ def get_client():
 
 def check_model() -> bool:
     try:
-        r = get_client().get(f"{LLAMA_SERVER_URL}/health", timeout=5)
+        r = get_client().get(f"{OLLAMA_URL}/api/tags", timeout=5)
         return r.status_code == 200
     except:
         return False
 
+OLLAMA_OPTIONS = {
+    "num_predict": 1024,
+    "temperature": 0.85,
+    "stop": ["<|im_end|>", "<|im_start|>"]
+}
+
 def generate(prompt: str, temperature: float = 0.85) -> str:
     client = get_client()
     try:
-        resp = client.post(f"{LLAMA_SERVER_URL}/completion", json={
+        options = {**OLLAMA_OPTIONS, "temperature": temperature}
+        resp = client.post(f"{OLLAMA_URL}/api/generate", json={
+            "model": MODEL_NAME,
             "prompt": prompt,
-            "temperature": temperature,
-            "n_predict": 1024,
-            "stop": ["<|im_end|>", "<|im_start|>"]
+            "stream": False,
+            "options": options
         }, timeout=300)
         resp.raise_for_status()
-        return resp.json()["content"].strip()
+        return resp.json().get("response", "").strip()
     except httpx.TimeoutException:
         raise TimeoutError("Timeout del modelo")
     except httpx.RequestError as e:
-        raise RuntimeError(f"Error conectando con llama-server: {e}")
+        raise RuntimeError(f"Error conectando con Ollama: {e}")
     except Exception as e:
         raise RuntimeError(f"Error: {e}")
 
 def generate_stream(prompt: str, temperature: float = 0.85) -> Generator[str, None, None]:
-    """Genera tokens uno por uno usando streaming SSE de llama-server."""
+    """Genera tokens uno por uno usando streaming SSE de Ollama."""
     client = get_client()
     try:
+        options = {**OLLAMA_OPTIONS, "temperature": temperature}
         with client.stream(
             "POST",
-            f"{LLAMA_SERVER_URL}/completion",
+            f"{OLLAMA_URL}/api/generate",
             json={
+                "model": MODEL_NAME,
                 "prompt": prompt,
-                "temperature": temperature,
-                "n_predict": 1024,
                 "stream": True,
-                "stop": ["<|im_end|>", "<|im_start|>"]
+                "options": options
             },
             timeout=300
         ) as resp:
@@ -62,23 +70,22 @@ def generate_stream(prompt: str, temperature: float = 0.85) -> Generator[str, No
             for line in resp.iter_lines():
                 if not line:
                     continue
-                if line.startswith("data: "):
-                    line = line[6:]
-                if not line.strip():
+                line = line.strip()
+                if not line:
                     continue
                 try:
                     obj = json.loads(line)
-                    token = obj.get("content", "")
+                    token = obj.get("response", "")
                     if token:
                         yield token
-                    if obj.get("stop"):
+                    if obj.get("done"):
                         break
                 except json.JSONDecodeError:
                     continue
     except httpx.TimeoutException:
         raise TimeoutError("Timeout del modelo (streaming)")
     except httpx.RequestError as e:
-        raise RuntimeError(f"Error conectando con llama-server: {e}")
+        raise RuntimeError(f"Error conectando con Ollama: {e}")
     except Exception as e:
         raise RuntimeError(f"Error streaming: {e}")
 
@@ -86,7 +93,7 @@ def list_models() -> list:
     """Lista modelos disponibles en Ollama."""
     try:
         with httpx.Client(timeout=10) as c:
-            r = c.get("http://localhost:11434/api/tags")
+            r = c.get(f"{OLLAMA_URL}/api/tags")
             if r.status_code == 200:
                 data = r.json()
                 return [m["name"] for m in data.get("models", [])]
