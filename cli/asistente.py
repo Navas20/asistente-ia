@@ -40,6 +40,7 @@ session_start = time.time()
 session_tokens = 0
 session_cost = 0.0
 messages_history = []
+stdout_lock = threading.Lock()
 
 # ═══════════════════════════════════════════════════════════════
 #  GENGAR THEME (paleta de colores)
@@ -82,6 +83,7 @@ class Theme:
     ITALIC = "\033[3m"
     RESET = "\033[0m"
     UNDERLINE = "\033[4m"
+    WHITE = "\033[97m"
 
 T = Theme
 
@@ -115,16 +117,38 @@ def elapsed_str():
 # ═══════════════════════════════════════════════════════════════
 
 GENGAR_SMALL = [
-    f"{T.PURPLE}      ▄████▄      {T.RESET}",
-    f"{T.PURPLE}    ██▀▀▀▀██    {T.RED}██{T.RESET}",
-    f"{T.PURPLE}   █▀░░░░░░▀█  {T.RED}████{T.RESET}",
-    f"{T.PURPLE}  █░░░░░░░░░░█{T.RED}█░░░██{T.RESET}",
-    f"{T.PURPLE}  █░░░░░░░░░░██░░░░██{T.RESET}",
-    f"{T.PURPLE}  █░▀▀▄▄▀▀░░█{T.RED}██░░░██{T.RESET}",
-    f"{T.PURPLE}  █░░░░░░░░░██░░░░░██{T.RESET}",
-    f"{T.PURPLE}   █▀░░░░░░▀█░░░░██{T.RESET}",
-    f"{T.PURPLE}    ██▄▄▄▄██  {T.RED}████{T.RESET}",
-    f"{T.PURPLE}      ▀████▀    {T.RED}██{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⡷⣦⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⡇⠈⠙⢷⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡇⠀⠀⠀⠙⢷⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣧⠀⠀⠀⠀⠀⠙⢷⣄⠀⠀⠀⢀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠀⠀⠀⠀⠀⠀⠀⠘⠳⣄⠀⣼⢷⣄⠀⣰⡀⠀⠀⠀⢀⣀⣤⡴⠶⠛⣿⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⢀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠳⣿⣀⣙⢷⡏⢻⣤⠶⠟⠛⠉⠀⠀⢀⣼⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⢠⡄⣿⠳⣤⣀⠀⠀⠀⠀⠀⢸⡆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠁⠀⠀⠀⠀⠁⠀⠀⠀⠀⠀⢀⣾⣡⣤⣤⣴⡆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⣿⡿⠿⠇⠀⠛⠿⣤⣀⠀⠀⢸⡇⠀⠀⠀⢀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠃⠀⠀⣸⠟⠀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⠀{T.RESET}",
+    f"{T.PURPLE}⢙⣿⡆⠀⠀⠀⠀⠀⠙⠳⢦⣸⡇⢀⡤⠖⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠉⠉⠉⠉⠙⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⣩⣿⠃{T.RESET}",
+    f"{T.PURPLE}⠸⠿⣭⡄⠀⠀⠀⠀⠀⠀⠀⢹⡷⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⡾⠋⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠈⢿⡄⠀⠀⠀⠀⠀⠀⠉⠀⠀⠀⠀⠀⣴⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣠⠞⠋⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⠀⢻⡄⠀⠀⢀⠀⠀⠀⠀⠀⠀⠀⢀⡼⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣠⡾⠟⠁⠀⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⠀⠀⠻⣄⢠⠏⠀⠀⠀⠀⠀⠀⣰⡏⠀⢻⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣠⡾⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⣹⠏⠀⠀⠀⢠⠀⠀⠀⡟⠀⠀⠘⣷⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣤⠾⠆⠀⠀⠀⠀⢶⢀⣴⠟⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⠀⠀⢠⡏⠀⠀⠀⠀⢸⣇⠀⠠⣷⡀⠀⠀⣿⣆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⡴⠞⠉⣿⠀⠀⠀⠀⠀⠀⢸⣏⣁⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⠀⠀⣼⠀⠀⠀⠀⠀⢸⡿⣦⡀⠈⠳⢦⣀⣀⣹⡄⠀⠀⠀⠀⠀⠀⠀⣀⣴⠛⠉⠀⠀⢀⡏⠀⠀⠀⠀⠀⠀⣸⠉⠉⠉⠉⠉⠙⠛⠛⠓⢶⣶⣤⡀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⠀⠀⣿⠀⠀⠀⠀⠀⣸⡇⠈⢷⣄⠀⠀⠀⠉⠉⠉⠀⠀⠀⠀⣠⣴⠛⠉⠏⠀⠀⠀⢀⡾⠁⠀⠀⠀⠀⠀⠐⣾⠃⠀⠀⠀⠀⠀⠀⠀⠀⠈⠛⢷⣾⡄⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⠀⢀⣿⠀⠀⠀⠀⠀⠹⣷⠀⣸⠋⠛⢦⣄⡀⠀⠀⠀⠀⠀⠀⠀⠈⠛⠶⠦⠤⠤⠞⠋⠀⢀⣤⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡀⣾⠛⠉⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⠀⠀⣿⠀⠀⠀⠀⠀⠀⠹⣿⡟⠀⠀⠀⢨⡏⠛⠲⠤⣤⣀⣀⡀⠀⠀⠀⠀⠀⢀⣀⣤⡶⠋⠀⠀⠀⠀⠀⡀⠀⠀⠀⠀⠀⣀⣤⡶⠞⠋⠛⠛⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⠀⢀⣿⡀⠀⠀⠀⠀⠀⠀⠈⠻⣄⡀⠀⣾⠀⠀⠀⠀⠀⠈⢹⡏⠉⠛⠛⠛⡿⠉⣍⡾⠁⠀⠀⠀⠀⠀⢀⣏⣀⣤⡴⠶⠛⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⢀⡾⠉⣧⠀⠀⠀⠀⠀⠀⠀⠀⠈⠛⢦⣇⡀⠀⠀⠀⠀⠀⣾⠀⠀⠀⠀⢸⢇⡴⠋⠀⠀⠀⠀⠀⠀⠀⣾⠋⠉⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⣸⠇⠀⠹⡆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠉⠓⠶⠤⣤⣴⣧⣠⣤⣤⠴⠟⠉⠀⠀⠀⠀⠀⠀⠀⠀⣼⠏⠂⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⣿⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣼⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⢹⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⣶⡄⣾⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⠀⢻⣦⠀⠀⠀⠀⠻⣆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢻⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⠀⠀⠙⠻⣦⡄⠀⢀⣈⣳⣤⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⠈⠘⢷⣽⣭⣿⣾⡎⠙⠷⣤⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠙⠟⠀⠁⠀⠀⠀⠉⠻⣗⠲⠶⠴⢦⡶⠶⣦⡀⠀⠀⢀⡀⠀⣀⠀⠀⠀⣠⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠳⣦⣠⡿⠀⠀⠘⣷⡀⢠⠟⢳⠟⢹⡧⣦⣠⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠀⠀⠀⠀⠘⣷⡿⠀⠀⠀⠀⣸⡿⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⠳⠦⠤⠴⠞⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
+    f"{T.PURPLE}⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⣀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀{T.RESET}",
 ]
 
 # ═══════════════════════════════════════════════════════════════
@@ -184,25 +208,6 @@ def print_home_screen():
     subtitle = f"{T.MUTED}v4.0 · Gengar Theme{T.RESET}"
     print_centered(title, tw)
     print_centered(subtitle, tw)
-
-    print_empty_lines(2)
-
-    # ─── Prompt Input Area (OpenCode style) ───
-    prompt_w = min(70, tw - 8)
-    prompt_left = (tw - prompt_w) // 2
-
-    # Top decorative line
-    print(" " * prompt_left + f"{T.BORDER}╹{'─' * (prompt_w - 1)}{T.RESET}")
-
-    # Input box with left border
-    print(" " * prompt_left + f"{T.BORDER}┃{T.RESET} {T.BG_ELEMENT}  Ask anything... {' ' * (prompt_w - 22)}{T.RESET}")
-
-    # Agent/model info line
-    agent_info = f"{T.HIGHLIGHT}{T.BOLD}Artenisa{T.RESET} {T.DIM}·{T.RESET} {T.TEXT}{current_model}{T.RESET} {T.DIM}·{T.RESET} {T.MUTED}local{T.RESET}"
-    print(" " * prompt_left + f"{T.BORDER}┃{T.RESET} {agent_info}")
-
-    # Bottom decorative shadow
-    print(" " * prompt_left + f"{T.BORDER}╹{T.BG_ELEMENT}▀{'▀' * (prompt_w - 2)}{T.RESET}")
 
     print_empty_lines(2)
 
@@ -377,7 +382,8 @@ class Spinner:
         while self.running:
             frame = self.FRAMES[self.idx % len(self.FRAMES)]
             color = self.COLORS[self.idx % len(self.COLORS)]
-            print_status_bar(f"{color}{frame}{T.RESET}")
+            with stdout_lock:
+                print_status_bar(f"{color}{frame}{T.RESET}")
             time.sleep(0.08)
             self.idx += 1
 
@@ -385,7 +391,8 @@ class Spinner:
         self.running = False
         if self.thread:
             self.thread.join(timeout=0.5)
-        clear_status_bar()
+        with stdout_lock:
+            clear_status_bar()
 
 # ═══════════════════════════════════════════════════════════════
 #  INPUT HANDLING (OpenCode style prompt)
@@ -481,8 +488,9 @@ def send_message_stream(msg):
                 if obj.get("type") == "token":
                     token = obj["content"]
                     full_response.append(token)
-                    sys.stdout.write(f"{T.GREEN}{token}{T.RESET}")
-                    sys.stdout.flush()
+                    with stdout_lock:
+                        sys.stdout.write(f"{T.GREEN}{token}{T.RESET}")
+                        sys.stdout.flush()
                     session_tokens += 1
                 elif obj.get("type") == "done":
                     conv_id = obj.get("conversation_id", conv_id)
@@ -746,7 +754,7 @@ def main():
             if cmd_lower == "/tokens":
                 print_separator("TOKEN USAGE")
                 print_left_border(f"  Tokens: {T.HIGHLIGHT}{session_tokens}{T.RESET}")
-                print_left_border(f"  Cost:   {T.HIGHLIGHT}${session_cost:.4f}{T.RESET}")
+                print_left_border(f"  Cost:   {T.HIGHLIGHT}local (free){T.RESET}")
                 print_left_border(f"  Time:   {T.HIGHLIGHT}{elapsed_str()}{T.RESET}")
                 print_left_border(f"  Model:  {T.HIGHLIGHT}{current_model}{T.RESET}")
                 print_separator()
@@ -770,14 +778,17 @@ def main():
                 continue
 
             if cmd_lower == "/editor":
-                # Open external editor
-                editor = os.environ.get("EDITOR", os.environ.get("VISUAL", "notepad"))
-                tmp = Path(tempfile.gettempdir()) / f"artenisa_{os.urandom(4).hex()}.txt"
-                tmp.write_text("", encoding="utf-8")
-                subprocess.run([editor, str(tmp)], timeout=120)
-                msg = tmp.read_text(encoding="utf-8").strip()
-                tmp.unlink(missing_ok=True)
-                if not msg:
+                try:
+                    editor = os.environ.get("EDITOR", os.environ.get("VISUAL", "notepad"))
+                    tmp = Path(tempfile.gettempdir()) / f"artenisa_{os.urandom(4).hex()}.txt"
+                    tmp.write_text("", encoding="utf-8")
+                    subprocess.run([editor, str(tmp)], timeout=120)
+                    msg = tmp.read_text(encoding="utf-8").strip()
+                    tmp.unlink(missing_ok=True)
+                    if not msg:
+                        continue
+                except Exception as e:
+                    print_left_border(f"{T.ERROR}Editor error: {e}{T.RESET}")
                     continue
 
             if cmd_lower == "/status":
