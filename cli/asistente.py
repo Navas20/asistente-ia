@@ -207,20 +207,21 @@ def main():
         screen.log(f"  {T.BORDER}┃{T.RESET} {T.PURPLE}{T.BOLD}Artenisa v4.0{T.RESET} {T.MUTED}· Gengar Theme{T.RESET}")
         screen.log(f"  {T.BORDER}┃{T.RESET} {T.DIM}/ayuda para comandos · Ctrl+C para salir{T.RESET}")
 
-        while True:
-            if screen.check_resize():
-                screen.redraw()
+        try:
+            while True:
+                if screen.check_resize():
+                    screen.redraw()
 
-            action = screen.handle_input()
+                action = screen.handle_input()
 
-            if action is None:
-                time.sleep(0.01)
-                continue
+                if action is None:
+                    time.sleep(0.01)
+                    continue
 
-            action_type, msg = action
+                action_type, msg = action
 
-            if action_type == "exit":
-                break
+                if action_type == "exit":
+                    break
 
             if action_type == "submit":
                 cmd_lower = msg.lower()
@@ -502,6 +503,9 @@ def main():
                 screen.set_status(
                     f"{current_model} · {session_tokens} tok · {elapsed_str()}"
                 )
+
+        except KeyboardInterrupt:
+            pass
 
 if __name__ == "__main__":
     main()
