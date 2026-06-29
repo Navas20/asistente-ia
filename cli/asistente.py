@@ -16,7 +16,19 @@ from display import Screen, Theme, truncate_ansi, visible_len
 T = Theme()
 
 API_URL = os.getenv("API_URL", "http://localhost:8000")
-AUTH_TOKEN = os.getenv("AUTH_TOKEN", "test-token")
+
+# ─── Token: leer desde backend/.env, luego env var ───
+AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
+if not AUTH_TOKEN:
+    env_path = Path(__file__).parent.parent / "backend" / ".env"
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith("AUTH_TOKEN="):
+                AUTH_TOKEN = line.split("=", 1)[1].strip().strip('"').strip("'")
+                break
+if not AUTH_TOKEN:
+    print("ERROR: AUTH_TOKEN no configurado. Ponlo en backend/.env o en variable de entorno.")
+    sys.exit(1)
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")

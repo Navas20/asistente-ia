@@ -39,6 +39,15 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
 )
 
+# ─── Cargar .env manualmente ───
+_env_path = Path(__file__).parent / ".env"
+if _env_path.exists():
+    for _line in _env_path.read_text("utf-8").splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            k, v = _line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
 MODEL_NAME = os.getenv("MODEL_NAME", "personal")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
@@ -301,7 +310,7 @@ def _safe_args(cmd: str) -> list:
     except ValueError:
         return cmd.split()
 
-TOOL_CMD_RE
+TOOL_CMD_RE = re.compile(r'!ejecutar:\s*(.+)', re.IGNORECASE)
 TOOL_SEARCH_RE = re.compile(r'!buscar:\s*(.+)', re.IGNORECASE)
 TOOL_READ_RE = re.compile(r'!leer:\s*(.+)', re.IGNORECASE)
 TOOL_WRITE_RE = re.compile(r'!escribir:\s*(.+)', re.IGNORECASE)
