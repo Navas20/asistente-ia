@@ -4,7 +4,7 @@ import threading
 import time
 import logging
 from functools import wraps
-from datetime import datetime
+from datetime import datetime, timezone
 
 log = logging.getLogger("artenisa.security")
 
@@ -41,16 +41,13 @@ def get_role(user_id: int) -> str:
 def require_role(min_role: str = "operator"):
     def decorator(func):
         @wraps(func)
-        def wrapper(*args, **kwargs):
-            user_id = kwargs.get("user_id", args[0] if args else None)
-            if user_id is None:
-                return {"error": "No autorizado"}
+        def wrapper(user_id, *args, **kwargs):
             role = get_role(user_id)
             if role == "denied":
                 return {"error": "No autorizado"}
             if min_role == "admin" and role != "admin":
                 return {"error": "Se requiere rol admin"}
-            return func(*args, **kwargs)
+            return func(user_id, *args, **kwargs)
         return wrapper
     return decorator
 
@@ -90,7 +87,7 @@ class AuditLog:
         try:
             conn.execute(
                 "INSERT INTO audit_log (user_id, username, command, target, timestamp, status, details) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (user_id, username, command, target, datetime.utcnow().isoformat(), status, details),
+                (user_id, username, command, target, datetime.now(timezone.utc).isoformat(), status, details),
             )
             conn.commit()
         finally:
@@ -134,4 +131,6 @@ class RateLimiter:
             remaining = max_calls - len(bucket["calls"])
             oldest = bucket["calls"][0]
             reset_after = max(0, int(window - (now - oldest)))
+            if len(bucket["calls"]) <= 1:
+                reset_after = 0
             return (True, remaining, reset_after)
