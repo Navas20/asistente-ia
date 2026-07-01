@@ -37,7 +37,7 @@ conv_id = None
 voice_mode = False
 current_model = "personal"
 session_start = time.time()
-session_tokens = 0
+session_tokens = "∞"
 messages_history = []
 
 def elapsed_str():
@@ -108,7 +108,6 @@ def send_message_stream(msg, token_callback=None):
             try:
                 obj = json.loads(line)
                 if obj.get("type") == "token":
-                    session_tokens += 1
                     if token_callback:
                         token_callback(obj["content"])
                 elif obj.get("type") == "done":
@@ -214,7 +213,7 @@ def main():
     global conv_id, session_start, session_tokens, current_model, voice_mode
 
     with Screen(Theme()) as screen:
-        screen.set_status(f"{current_model} · 0 tok · {elapsed_str()}")
+        screen.set_status(f"{current_model} · {session_tokens} tok · {elapsed_str()}")
         show_gengar(screen)
         screen.log(f"  {T.BORDER}┃{T.RESET} {T.PURPLE}{T.BOLD}Artenisa v4.0{T.RESET} {T.MUTED}· Gengar Theme{T.RESET}")
         screen.log(f"  {T.BORDER}┃{T.RESET} {T.DIM}/ayuda para comandos · Ctrl+C para salir{T.RESET}")
@@ -254,12 +253,12 @@ def main():
 
                 if cmd_lower in ("/nueva", "new", "reset"):
                     conv_id = None
-                    session_tokens = 0
+                    session_tokens = "∞"
                     session_start = time.time()
                     screen.conversation.clear()
                     screen.log(f"  {T.BORDER}┃{T.RESET} {T.PURPLE}{T.BOLD}Artenisa v4.0{T.RESET} {T.MUTED}· Gengar Theme{T.RESET}")
                     screen.log(f"  {T.BORDER}┃{T.RESET} {T.WARNING}New conversation{T.RESET}")
-                    screen.set_status(f"{current_model} · 0 tok · {elapsed_str()}")
+                    screen.set_status(f"{current_model} · {session_tokens} tok · {elapsed_str()}")
                     continue
 
                 if cmd_lower == "/modelos":
@@ -368,7 +367,7 @@ def main():
                 if cmd_lower == "/tokens":
                     t = int(time.time() - session_start)
                     screen.log(f"  {T.BORDER}┃{T.RESET} {T.BOLD}TOKEN STATS{T.RESET}")
-                    screen.log(f"  {T.BORDER}┃{T.RESET}  Tokens:  {T.HIGHLIGHT}{session_tokens}{T.RESET}")
+                    screen.log(f"  {T.BORDER}┃{T.RESET}  Tokens:  {T.HIGHLIGHT}∞ (sin límite){T.RESET}")
                     screen.log(f"  {T.BORDER}┃{T.RESET}  Time:    {T.HIGHLIGHT}{elapsed_str()}{T.RESET}")
                     screen.log(f"  {T.BORDER}┃{T.RESET}  Cost:    {T.HIGHLIGHT}local (free){T.RESET}")
                     screen.set_status(f"{current_model} · {session_tokens} tok · {elapsed_str()}")
@@ -430,7 +429,7 @@ def main():
                     screen.log(f"  {T.BORDER}┃{T.RESET} {T.BOLD}SYSTEM STATUS{T.RESET}")
                     screen.log(f"  {T.BORDER}┃{T.RESET}  API:     {T.SUCCESS}Online{T.RESET}")
                     screen.log(f"  {T.BORDER}┃{T.RESET}  Model:   {T.HIGHLIGHT}{current_model}{T.RESET}")
-                    screen.log(f"  {T.BORDER}┃{T.RESET}  Tokens:  {T.HIGHLIGHT}{session_tokens}{T.RESET}")
+                    screen.log(f"  {T.BORDER}┃{T.RESET}  Tokens:  {T.HIGHLIGHT}∞ (sin límite){T.RESET}")
                     screen.log(f"  {T.BORDER}┃{T.RESET}  Time:    {T.HIGHLIGHT}{elapsed_str()}{T.RESET}")
                     screen.log(f"  {T.BORDER}┃{T.RESET}  Conv:    {T.HIGHLIGHT}{'Active' if conv_id else 'New'}{T.RESET}")
                     screen.set_status(f"{current_model} · {session_tokens} tok · {elapsed_str()}")

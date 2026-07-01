@@ -5,6 +5,7 @@ import time
 import logging
 from functools import wraps
 from datetime import datetime, timezone
+from fastapi import HTTPException
 
 log = logging.getLogger("artenisa.security")
 
@@ -134,3 +135,16 @@ class RateLimiter:
             if len(bucket["calls"]) <= 1:
                 reset_after = 0
             return (True, remaining, reset_after)
+
+    def wrap(self, max_calls: int = 10, window: int = 60):
+        def decorator(func):
+            @wraps(func)
+            def wrapper(*args, **kwargs):
+                authorization = kwargs.get("authorization")
+                key = authorization or "global"
+                allowed, _, reset_after = self.check(key, max_calls=max_calls, window=window)
+                if not allowed:
+                    raise HTTPException(429, f"Límite de peticiones excedido. Reintenta en {reset_after}s")
+                return func(*args, **kwargs)
+            return wrapper
+        return decorator

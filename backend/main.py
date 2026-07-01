@@ -19,6 +19,15 @@ import uvicorn
 
 from workflows import ejecutar_workflow, listar_workflows
 
+# ─── V5 modules ───
+from target_engine import TargetEngine
+from memory_engine import MemoryEngine
+from task_queue import TaskQueue
+from security import AuditLog, RateLimiter
+from playbooks import list_playbooks, run_playbook
+from report_generator import generate_report
+import hacking
+
 try:
     import voice as voice_module
     VOICE_AVAILABLE = True
@@ -120,6 +129,13 @@ def init_db():
         log.info("Base de datos inicializada")
 
 init_db()
+
+# ─── V5 module instances ───
+_target_engine = TargetEngine()
+_memory_engine = MemoryEngine()
+_task_queue = TaskQueue()
+_audit_log = AuditLog()
+_rate_limiter = RateLimiter()
 
 # ─── httpx client reutilizable ───
 
@@ -1012,6 +1028,110 @@ def list_models(authorization: str = Header(None)):
 @app.get("/health")
 def health():
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+
+# ─── V5 Endpoints ───
+
+@_rate_limiter.wrap
+@app.get("/v5/target")
+def v5_get_target(authorization: str = Header(None)):
+    verify_token(authorization)
+    return _target_engine.get_target(0)
+
+@_rate_limiter.wrap
+@app.post("/v5/target")
+def v5_set_target(data: dict = Body(...), authorization: str = Header(None)):
+    verify_token(authorization)
+    target = data.get("target", "")
+    target_type = data.get("target_type", "domain")
+    _target_engine.set_target(0, target, target_type)
+    return {"status": "ok", "target": target, "target_type": target_type}
+
+@_rate_limiter.wrap
+@app.get("/v5/playbooks")
+def v5_list_playbooks(authorization: str = Header(None)):
+    verify_token(authorization)
+    return list_playbooks()
+
+@_rate_limiter.wrap
+@app.post("/v5/playbooks/{name}")
+def v5_run_playbook(name: str, data: dict = Body(...), authorization: str = Header(None)):
+    verify_token(authorization)
+    target = data.get("target", "")
+    depth = data.get("depth", "rapido")
+    task_id = _task_queue.submit(name, target=target, depth=depth)
+    return {"task_id": task_id, "status": "queued"}
+
+@_rate_limiter.wrap
+@app.get("/v5/tasks")
+def v5_list_tasks(authorization: str = Header(None)):
+    verify_token(authorization)
+    return {"tasks": _task_queue.list_tasks()}
+
+@_rate_limiter.wrap
+@app.get("/v5/tasks/{task_id}")
+def v5_get_task(task_id: str, authorization: str = Header(None)):
+    verify_token(authorization)
+    return _task_queue.get_status(task_id)
+
+@_rate_limiter.wrap
+@app.post("/v5/tasks/{task_id}/cancel")
+def v5_cancel_task(task_id: str, authorization: str = Header(None)):
+    verify_token(authorization)
+    return {"status": "cancelled"}
+
+@_rate_limiter.wrap
+@app.post("/v5/report")
+def v5_generate_report(data: dict = Body(...), authorization: str = Header(None)):
+    verify_token(authorization)
+    target = data.get("target", "")
+    fmt = data.get("format", "md")
+    results = data.get("results", [])
+    playbook = data.get("playbook", "")
+    report = generate_report(target, fmt, results, playbook)
+    return report
+
+@_rate_limiter.wrap
+@app.post("/v5/hacking/{tool}")
+def v5_hacking_tool(tool: str, data: dict = Body(...), authorization: str = Header(None)):
+    verify_token(authorization)
+    target = data.get("target", "")
+    try:
+        tool_fn = getattr(hacking, tool)
+        result = tool_fn(target)
+        return {"tool": tool, "target": target, "result": result}
+    except AttributeError:
+        raise HTTPException(404, f"Herramienta '{tool}' no encontrada")
+    except Exception as e:
+        raise HTTPException(500, f"Error ejecutando {tool}: {e}")
+
+@_rate_limiter.wrap
+@app.get("/v5/audit")
+def v5_get_audit(authorization: str = Header(None)):
+    verify_token(authorization)
+    return {"entries": _audit_log.get_recent(50)}
+
+@_rate_limiter.wrap
+@app.post("/v5/memory/operational")
+def v5_store_operational_memory(data: dict = Body(...), authorization: str = Header(None)):
+    verify_token(authorization)
+    conversation_id = data.get("conversation_id", "")
+    context = data.get("context", {})
+    _memory_engine.store_operational(conversation_id, context)
+    return {"status": "stored", "conversation_id": conversation_id}
+
+@_rate_limiter.wrap
+@app.get("/v5/memory/operational/{conv_id}")
+def v5_get_operational_memory(conv_id: str, authorization: str = Header(None)):
+    verify_token(authorization)
+    memory = _memory_engine.get_operational(conv_id)
+    return {"conversation_id": conv_id, "memory": memory}
+
+@_rate_limiter.wrap
+@app.get("/v5/memory/history/{target}")
+def v5_get_history_memory(target: str, authorization: str = Header(None)):
+    verify_token(authorization)
+    memory = _memory_engine.get_history(target)
+    return {"target": target, "memory": memory}
 
 # ─── Main ───
 

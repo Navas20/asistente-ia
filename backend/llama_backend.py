@@ -12,6 +12,8 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 MODEL_NAME = os.getenv("MODEL_NAME", "personal")
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "60"))
 OLLAMA_MAX_RETRIES = int(os.getenv("OLLAMA_MAX_RETRIES", "2"))
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "2048"))
+OLLAMA_STOP_TOKENS = [token.strip() for token in os.getenv("OLLAMA_STOP_TOKENS", "").split(",") if token.strip()]
 
 _httpx_client = None
 
@@ -45,10 +47,11 @@ def check_model() -> bool:
         return False
 
 OLLAMA_OPTIONS = {
-    "num_predict": 1024,
+    "num_predict": OLLAMA_NUM_PREDICT,
     "temperature": 0.85,
-    "stop": ["<|im_end|>", "<|im_start|>"]
 }
+if OLLAMA_STOP_TOKENS:
+    OLLAMA_OPTIONS["stop"] = OLLAMA_STOP_TOKENS
 
 def generate(prompt: str, temperature: float = 0.85) -> str:
     client = get_client()
