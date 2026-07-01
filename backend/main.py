@@ -335,7 +335,10 @@ HERRAMIENTAS DISPONIBLES (escribe el comando exacto en tu respuesta para usarlas
 !razonar: problema  - Piensa paso a paso antes de responder
 
 REGLAS:
-- Cuando necesites datos, ESCRIBE el comando exacto en tu respuesta. Yo lo ejecuto y te doy el resultado.
+- Responde de forma natural primero. No conviertas cada mensaje en una cascada de herramientas.
+- Usa herramientas solo cuando sean claramente útiles, necesarias o el usuario haya pedido una acción concreta.
+- Si el problema es simple o conversacional, responde directamente sin herramientas.
+- Si necesitas datos reales, ESCRIBE el comando exacto en tu respuesta. Yo lo ejecuto y te doy el resultado.
 - Ejemplo: !leer: C:/Users/ASUS/archivo.txt
 - No digas "voy a leer" — directamente escribe !leer:
 - Para editar usa !editar: ruta "texto exacto a reemplazar" "texto nuevo"
