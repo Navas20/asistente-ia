@@ -63,6 +63,10 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 DB_PATH = os.getenv("DB_PATH", "data/conversations.db")
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "data/uploads"))
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
+MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "8"))
+MAX_MESSAGE_CHARS = int(os.getenv("MAX_MESSAGE_CHARS", "1800"))
+MAX_MEMORY_ITEMS = int(os.getenv("MAX_MEMORY_ITEMS", "6"))
+MAX_MEMORY_CHARS = int(os.getenv("MAX_MEMORY_CHARS", "600"))
 TOOL_TIMEOUT = int(os.getenv("TOOL_TIMEOUT", "60"))
 
 MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", str(20 * 1024 * 1024)))  # 20MB
@@ -268,11 +272,38 @@ def trigger_memory_extraction(user_msg: str, assistant_resp: str):
 
 MEMORY_INJECTION_TEMPLATE = "[MEMORIA DEL USUARIO]\n{items}"
 
-def format_memories(memories: dict) -> str:
+def _truncate_text(text: str, limit: int) -> str:
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)] + "..."
+
+
+def _prepare_history_for_prompt(history: list, limit: int = None, max_chars: int = None) -> list:
+    limit = limit if limit is not None else MAX_HISTORY_TURNS
+    max_chars = max_chars if max_chars is not None else MAX_MESSAGE_CHARS
+    prepared = []
+    for item in history[-limit:]:
+        content = _truncate_text(item.get("content", ""), max_chars)
+        entry = {"role": item.get("role", "user"), "content": content}
+        tool_output = item.get("tool_output")
+        if tool_output:
+            entry["tool_output"] = _truncate_text(str(tool_output), 800)
+        prepared.append(entry)
+    return prepared
+
+
+def format_memories(memories: dict, max_items: int = None, max_chars: int = None) -> str:
     if not memories:
         return ""
-    items = "\n".join(f"  {k.replace('_', ' ').title()}: {v}" for k, v in memories.items())
-    return MEMORY_INJECTION_TEMPLATE.format(items=items)
+    max_items = max_items if max_items is not None else MAX_MEMORY_ITEMS
+    max_chars = max_chars if max_chars is not None else MAX_MEMORY_CHARS
+    items = []
+    for key, value in list(memories.items())[:max_items]:
+        value = _truncate_text(str(value), max_chars)
+        items.append(f"  {key.replace('_', ' ').title()}: {value}")
+    return MEMORY_INJECTION_TEMPLATE.format(items="\n".join(items))
 
 SYSTEM_PROMPT = r"""Eres Artenisa, mi asistente personal y compañero de ingeniería. Tu misión es comprenderme profundamente, anticiparte a mis necesidades y ayudarme a construir, depurar, mejorar y escalar sistemas con la mayor calidad posible.
 
@@ -352,13 +383,13 @@ def build_prompt(history: list, new_message: str, memories: dict) -> str:
     if mem_block:
         parts.append(f"<|im_start|>system\n{mem_block}<|im_end|>")
     parts.append(f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>")
-    for h in history:
+    for h in _prepare_history_for_prompt(history):
         role = "user" if h["role"] == "user" else "assistant"
-        content = h['content']
+        content = h["content"]
         if h.get("tool_output"):
             content += f"\n[Resultado: {h['tool_output']}]"
         parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
-    parts.append(f"<|im_start|>user\n{new_message}<|im_end|>")
+    parts.append(f"<|im_start|>user\n{_truncate_text(new_message, 2200)}<|im_end|>")
     parts.append("<|im_start|>assistant\n")
     return "\n".join(parts)
 
