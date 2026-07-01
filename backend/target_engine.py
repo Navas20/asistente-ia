@@ -1,4 +1,3 @@
-import os
 import json
 import logging
 from datetime import datetime
@@ -19,7 +18,7 @@ class TargetEngine:
         if TARGET_FILE.exists():
             try:
                 self._data = json.loads(TARGET_FILE.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, FileNotFoundError):
+            except (json.JSONDecodeError, OSError):
                 self._data = {}
         else:
             self._data = {}
