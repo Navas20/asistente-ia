@@ -28,13 +28,16 @@ def generate_report(target: str, data: dict, fmt: str = "md") -> dict:
     path = REPORTS_DIR / filename
 
     generators = {"md": generate_markdown, "html": generate_html, "json": generate_json}
-    content = generators[fmt](target, data)
-
-    if len(content) > MAX_CONTENT_LENGTH:
-        content = content[:MAX_CONTENT_LENGTH]
+    gen = generators.get(fmt)
+    if gen is None:
+        raise ValueError(f"Formato no soportado: {fmt}. Usa: md, html, json")
+    content = gen(target, data)
 
     path.write_text(content, encoding="utf-8")
     size = path.stat().st_size
+
+    if len(content) > MAX_CONTENT_LENGTH:
+        content = content[:MAX_CONTENT_LENGTH]
 
     return {
         "format": fmt,
@@ -87,25 +90,49 @@ def generate_html(target: str, data: dict) -> str:
     md = generate_markdown(target, data)
 
     body = []
+    in_list = False
     for line in md.split("\n"):
         if line.startswith("# "):
+            if in_list:
+                body.append("</ul>")
+                in_list = False
             body.append(f"<h1>{line[2:]}</h1>")
         elif line.startswith("## "):
+            if in_list:
+                body.append("</ul>")
+                in_list = False
             body.append(f"<h2>{line[3:]}</h2>")
         elif line.startswith("**") and line.endswith("**"):
+            if in_list:
+                body.append("</ul>")
+                in_list = False
             body.append(f"<p>{line}</p>")
         elif line.startswith("- **"):
+            if in_list:
+                body.append("</ul>")
+                in_list = False
             m = re.match(r"- \*\*(.+?):\*\* (.+)", line)
             if m:
                 body.append(f"<p><strong>{m.group(1)}:</strong> {m.group(2)}</p>")
             else:
                 body.append(f"<p>{line[2:]}</p>")
         elif line.startswith("- "):
+            if not in_list:
+                body.append("<ul>")
+                in_list = True
             body.append(f"<li>{line[2:]}</li>")
         elif line == "":
+            if in_list:
+                body.append("</ul>")
+                in_list = False
             body.append("")
         else:
+            if in_list:
+                body.append("</ul>")
+                in_list = False
             body.append(f"<p>{line}</p>")
+    if in_list:
+        body.append("</ul>")
 
     html = f"""<!DOCTYPE html>
 <html lang="es">
