@@ -103,15 +103,49 @@ class Screen:
     def _clear_line(self):
         sys.stdout.write("\033[K")
 
+    def _wrap_text(self, text, width):
+        segments = ANSI.split(text)
+        codes = ANSI.findall(text)
+        lines = []
+        current = ""
+        for i, segment in enumerate(segments):
+            if i > 0:
+                current += codes[i - 1]
+            for part in segment.split(" "):
+                if not current and not part:
+                    continue
+                prefix = " " if current and part else ""
+                candidate = current + prefix + part
+                if "\n" in candidate:
+                    pieces = candidate.split("\n")
+                    for piece in pieces[:-1]:
+                        if piece:
+                            lines.append(piece)
+                    current = pieces[-1]
+                    continue
+                if visible_len(candidate) > width and current:
+                    lines.append(current)
+                    current = part
+                else:
+                    current = candidate
+        if current:
+            lines.append(current)
+        return lines
+
     def _draw_conversation(self):
         visible = self.conversation[-(self.conv_rows):]
-        for i, line in enumerate(visible):
+        rendered = []
+        for line in visible:
+            wrapped = self._wrap_text(line, self.cols)
+            rendered.extend(wrapped)
+            if len(rendered) >= self.conv_rows:
+                break
+        for i, line in enumerate(rendered[: self.conv_rows]):
             row = i + 1
             self._gotoxy(row, 1)
             self._clear_line()
-            sys.stdout.write(truncate_ansi(line, self.cols))
-        # Clear remaining rows below conversation
-        for r in range(len(visible) + 1, self.conv_rows + 1):
+            sys.stdout.write(line)
+        for r in range(len(rendered) + 1, self.conv_rows + 1):
             self._gotoxy(r, 1)
             self._clear_line()
 
