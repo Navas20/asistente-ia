@@ -1,5 +1,4 @@
 import importlib
-import json
 import logging
 from pathlib import Path
 from typing import Optional
@@ -11,8 +10,12 @@ class PluginBase:
     name: str = ""
     version: str = "1.0.0"
     description: str = ""
-    commands: list = []
-    playbooks: list = []
+    commands: list = None
+    playbooks: list = None
+
+    def __init__(self):
+        self.commands = self.commands or []
+        self.playbooks = self.playbooks or []
 
     def on_load(self):
         pass
@@ -53,7 +56,7 @@ class PluginManager:
                     module_name, entry / "plugin.py"
                 )
                 if spec is None or spec.loader is None:
-                    logger.warning("No plugin.py in %s", entry.name)
+                    logger.warning("No hay plugin.py en %s", entry.name)
                     continue
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
@@ -64,9 +67,9 @@ class PluginManager:
                         instance = attr()
                         instance.on_load()
                         self._plugins[instance.name] = instance
-                        logger.info("Plugin loaded: %s v%s", instance.name, instance.version)
+                        logger.info("Plugin cargado: %s v%s", instance.name, instance.version)
             except Exception as exc:
-                logger.error("Failed to load plugin from %s: %s", entry.name, exc)
+                logger.error("Error al cargar plugin desde %s: %s", entry.name, exc)
 
     def get_plugin(self, name: str) -> Optional[PluginBase]:
         return self._plugins.get(name)
@@ -78,4 +81,4 @@ class PluginManager:
         for plugin in self._plugins.values():
             if command in plugin.commands:
                 return plugin.handle_command(command, args, context)
-        return {"error": f"No plugin handles command '{command}'"}
+        return {"error": f"Ningún plugin maneja el comando '{command}'"}
