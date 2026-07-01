@@ -56,7 +56,7 @@ class TaskQueue:
         with self._lock:
             task = self._tasks.get(task_id)
         if task is None:
-            return {"error": "Task not found"}
+            return {"error": "Tarea no encontrada"}
         return dict(task)
 
     def list_tasks(self, limit=10):
