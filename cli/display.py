@@ -49,6 +49,9 @@ class Theme:
     YELLOW = WARNING
     BG_DARK = "\033[48;5;234m"
 
+SIDEBAR_WIDTH = 28
+SIDEBAR_MIN_COLS = 90
+
 class Screen:
     def __init__(self, theme=None):
         self.theme = theme or Theme()
@@ -68,13 +71,35 @@ class Screen:
         self.status_text = ""
         self._running = True
         self._clean = False
+        self.session_info = {
+            "session_started": "",
+            "tokens": 0,
+            "context_pct": 0,
+            "cost": 0.0,
+            "model": "",
+            "mcp": [],
+            "version": "",
+        }
         self._update_size()
 
     def _update_size(self):
         self.cols, self.rows = shutil.get_terminal_size()
+        self.show_sidebar = self.cols >= SIDEBAR_MIN_COLS
+        if self.show_sidebar:
+            self.main_cols = self.cols - SIDEBAR_WIDTH - 1
+            self.sidebar_col = self.main_cols + 3
+        else:
+            self.main_cols = self.cols
+            self.sidebar_col = None
         self.conv_rows = max(1, self.rows - 2)
         self.status_row = self.rows - 1
         self.input_row = self.rows
+
+    def set_session(self, **kwargs):
+        self.session_info.update(kwargs)
+        if self.show_sidebar:
+            self._draw_sidebar()
+            sys.stdout.flush()
 
     def start(self):
         sys.stdout.write("\033[?25l\033[2J")
@@ -114,7 +139,7 @@ class Screen:
             for part in segment.split(" "):
                 if not current and not part:
                     continue
-                prefix = " " if current and part else ""
+                prefix = " " if visible_len(current) > 0 and part else ""
                 candidate = current + prefix + part
                 if "\n" in candidate:
                     pieces = candidate.split("\n")
@@ -136,22 +161,72 @@ class Screen:
         visible = self.conversation[-(self.conv_rows):]
         rendered = []
         for line in visible:
-            wrapped = self._wrap_text(line, self.cols)
+            wrapped = self._wrap_text(line, self.main_cols)
             rendered.extend(wrapped)
             if len(rendered) >= self.conv_rows:
                 break
         for i, line in enumerate(rendered[: self.conv_rows]):
             row = i + 1
             self._gotoxy(row, 1)
-            self._clear_line()
+            self._clear_line_main()
             sys.stdout.write(line)
         for r in range(len(rendered) + 1, self.conv_rows + 1):
             self._gotoxy(r, 1)
+            self._clear_line_main()
+
+    def _clear_line_main(self):
+        if self.show_sidebar:
+            sys.stdout.write(" " * self.main_cols)
+        else:
             self._clear_line()
+
+    def _draw_sidebar(self):
+        if not self.show_sidebar:
+            return
+        t = self.theme
+        info = self.session_info
+        divider_col = self.main_cols + 1
+        lines = []
+        lines.append(f"{t.PURPLE}{t.BOLD}Sesion{t.RESET}")
+        if info.get("session_started"):
+            lines.append(f"{t.MUTED}{info['session_started']}{t.RESET}")
+        lines.append("")
+        lines.append(f"{t.PURPLE}{t.BOLD}Contexto{t.RESET}")
+        lines.append(f"{t.TEXT}{info.get('tokens', 0):,} tokens{t.RESET}")
+        lines.append(f"{t.TEXT}{info.get('context_pct', 0)}% usado{t.RESET}")
+        lines.append(f"{t.MUTED}${info.get('cost', 0.0):.2f} gastado{t.RESET}")
+        mcp = info.get("mcp") or []
+        if mcp:
+            lines.append("")
+            lines.append(f"{t.PURPLE}{t.BOLD}MCP{t.RESET}")
+            for name, status in mcp:
+                color = t.GREEN if status.lower() in ("ok", "conectado") else t.WARNING
+                lines.append(f"{t.MUTED}\u2022 {name} {color}{status}{t.RESET}")
+        lines.append("")
+        if info.get("model"):
+            lines.append(f"{t.PURPLE}{t.BOLD}Modelo{t.RESET}")
+            lines.append(f"{t.TEXT}{info['model']}{t.RESET}")
+
+        for row in range(1, self.rows + 1):
+            self._gotoxy(row, divider_col)
+            sys.stdout.write(f"{t.BORDER}\u2502{t.RESET}")
+
+        for i in range(self.rows):
+            self._gotoxy(i + 1, self.sidebar_col)
+            sys.stdout.write(" " * (SIDEBAR_WIDTH - 2))
+        for i, line in enumerate(lines):
+            if i + 1 > self.rows:
+                break
+            self._gotoxy(i + 1, self.sidebar_col)
+            sys.stdout.write(truncate_ansi(line, SIDEBAR_WIDTH - 2))
+
+        if info.get("version"):
+            self._gotoxy(self.rows, self.sidebar_col)
+            sys.stdout.write(truncate_ansi(f"{t.DIM}{info['version']}{t.RESET}", SIDEBAR_WIDTH - 2))
 
     def _draw_status(self):
         self._gotoxy(self.status_row, 1)
-        self._clear_line()
+        self._clear_line_main()
         bar = (
             f"{self.theme.BG_STATUS}{self.theme.BOLD}{self.theme.PURPLE}"
             f" ARtenisa {self.theme.RESET}{self.theme.RESET_BG}"
@@ -159,27 +234,29 @@ class Screen:
             f" {self.theme.MUTED}{self.status_text}{self.theme.RESET}"
         )
         v = visible_len(bar)
-        if v > self.cols:
-            bar = truncate_ansi(bar, self.cols)
-        elif v < self.cols:
-            bar += " " * (self.cols - v)
+        if v > self.main_cols:
+            bar = truncate_ansi(bar, self.main_cols)
+        elif v < self.main_cols:
+            bar += " " * (self.main_cols - v)
+        self._gotoxy(self.status_row, 1)
         sys.stdout.write(bar)
 
     def _draw_input(self):
         self._gotoxy(self.input_row, 1)
-        self._clear_line()
-        prefix = f"  {self.theme.BORDER}┃{self.theme.RESET} {self.theme.TEXT}> {self.theme.RESET}"
+        self._clear_line_main()
+        self._gotoxy(self.input_row, 1)
+        prefix = f"  {self.theme.BORDER}\u2503{self.theme.RESET} {self.theme.TEXT}> {self.theme.RESET}"
         sys.stdout.write(prefix)
-        avail = self.cols - visible_len(prefix)
+        avail = self.main_cols - visible_len(prefix)
         sys.stdout.write(self.input_text[:avail])
-        # position cursor
         cx = visible_len(prefix + self.input_text[:self.input_cursor]) + 1
-        self._gotoxy(self.input_row, min(cx, self.cols))
+        self._gotoxy(self.input_row, min(cx, self.main_cols))
 
     def redraw(self):
         self._draw_conversation()
         self._draw_status()
         self._draw_input()
+        self._draw_sidebar()
         sys.stdout.flush()
 
     def log(self, text):
@@ -194,11 +271,7 @@ class Screen:
             self.log(text)
             return
         self.conversation[-1] = text
-        visible = self.conversation[-(self.conv_rows):]
-        row = len(visible)
-        self._gotoxy(row, 1)
-        self._clear_line()
-        sys.stdout.write(truncate_ansi(text, self.cols))
+        self._draw_conversation()
         self._draw_input()
         sys.stdout.flush()
 
@@ -256,14 +329,14 @@ class Screen:
             elif ch2 == b"K":
                 if self.input_cursor > 0:
                     self.input_cursor -= 1
-                    cx = visible_len(f"  ┃ > {self.input_text[:self.input_cursor]}") + 1
-                    self._gotoxy(self.input_row, min(cx, self.cols))
+                    cx = visible_len(f"  \u2503 > {self.input_text[:self.input_cursor]}") + 1
+                    self._gotoxy(self.input_row, min(cx, self.main_cols))
                     sys.stdout.flush()
             elif ch2 == b"M":
                 if self.input_cursor < len(self.input_text):
                     self.input_cursor += 1
-                    cx = visible_len(f"  ┃ > {self.input_text[:self.input_cursor]}") + 1
-                    self._gotoxy(self.input_row, min(cx, self.cols))
+                    cx = visible_len(f"  \u2503 > {self.input_text[:self.input_cursor]}") + 1
+                    self._gotoxy(self.input_row, min(cx, self.main_cols))
                     sys.stdout.flush()
             return None
 
@@ -330,11 +403,8 @@ class Screen:
     def check_resize(self):
         new_cols, new_rows = shutil.get_terminal_size()
         if new_cols != self.cols or new_rows != self.rows:
-            self.cols = new_cols
-            self.rows = new_rows
-            self.conv_rows = max(1, self.rows - 2)
-            self.status_row = self.rows - 1
-            self.input_row = self.rows
+            self._update_size()
+            sys.stdout.write("\033[2J")
             return True
         return False
 
