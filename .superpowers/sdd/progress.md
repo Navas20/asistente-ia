@@ -1,0 +1,8 @@
+Task 1: complete (commits e72c3b9..1ce2ccd, review clean, minors: path consistency, datetime deprecation, no committed tests)
+Task 2: complete (commits 1ce2ccd..969dbd9, review clean, minors: banner duplication, no newline EOF, generate_wordlist OOM risk)
+Task 3: complete (commits 969dbd9..0f98a96, review clean, minors: unused imports, depth passthrough, return format compat)
+Task 4: complete (commits 0f98a96..5e7d23d, review clean, minor: english error string fixed)
+Task 5: complete (commits 5e7d23d..6814d2a, review clean after fixes: reset calc, require_role, datetime deprecation)
+Task 6: complete (commits 6814d2a..3d6b2c3, review clean after fixes: unused import, spanish, mutable defaults)
+Task 7: complete (commits 3d6b2c3..77d095b, review clean after fixes: full write, valid HTML, error handling)
+Task 8: complete (commits 77d095b..65ee927, review clean)
