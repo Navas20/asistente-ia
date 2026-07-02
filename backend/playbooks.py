@@ -3,6 +3,17 @@ import logging
 log = logging.getLogger("artenisa.playbooks")
 
 PLAYBOOKS = {
+    "network_discovery": {
+        "name": "Descubrimiento de Red Local",
+        "description": "Escanea redes WiFi y dispositivos en la red local (ARP, ping sweep, interfaces)",
+        "target_type": "local",
+        "depth_estimate": "rapido",
+        "steps": [
+            {"id": "interfaces", "label": "Detección de Interfaces", "tool": "get_local_ip"},
+            {"id": "wifi", "label": "Escaneo de Redes WiFi", "tool": "scan_wifi_networks"},
+            {"id": "devices", "label": "Descubrimiento de Dispositivos", "tool": "scan_local_network"},
+        ],
+    },
     "recon_web": {
         "name": "Reconocimiento Web",
         "description": "Recolecta información pública de un dominio: DNS, subdominios, puertos, tecnologías y directorios",

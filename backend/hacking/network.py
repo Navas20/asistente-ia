@@ -148,6 +148,171 @@ def subdomain_scan(domain: str, wordlist: list = None) -> list:
                 found.append(r)
     return sorted(found)
 
+def get_local_ip(_target: str | None = None) -> dict:
+    """Obtiene IP local, subred y gateway de todas las interfaces activas."""
+    interfaces = []
+    default_gateway = None
+
+    def _val(line):
+        return line.split(":", 1)[-1].strip() if ": " in line else ""
+
+    try:
+        r = subprocess.run(["ipconfig"], capture_output=True, text=True, timeout=15)
+        current = None
+        for line in r.stdout.splitlines():
+            raw = line
+            line = line.strip()
+            if not line:
+                continue
+            if "Adaptador de " in raw:
+                if current and current.get("ip"):
+                    interfaces.append(current)
+                name = raw.split("Adaptador de ", 1)[-1].split(":")[0].strip()
+                current = {"name": name, "ip": "", "netmask": "", "gateway": ""}
+                continue
+            if current is None:
+                continue
+            if "Direcci" in line and "IPv4" in line:
+                current["ip"] = _val(line)
+            elif "subred" in line.lower():
+                current["netmask"] = _val(line)
+            elif "Puerta de enlace" in line:
+                gw = _val(line)
+                if gw:
+                    default_gateway = gw
+                    current["gateway"] = gw
+        if current and current.get("ip"):
+            interfaces.append(current)
+
+        interfaces = [i for i in interfaces if not i["ip"].startswith("127.") and i["ip"]]
+    except Exception:
+        pass
+
+    if not interfaces:
+        try:
+            hostname = socket.gethostname()
+            local_ip = socket.gethostbyname(hostname)
+            interfaces = [{"name": "default", "ip": local_ip, "netmask": "", "gateway": ""}]
+        except Exception as e:
+            return {"error": str(e), "interfaces": []}
+
+    return {
+        "interfaces": interfaces,
+        "default_gateway": default_gateway,
+    }
+
+def scan_local_network(timeout: float = 1.0) -> dict:
+    """Escanea la red local con ping sweep y ARP para descubrir dispositivos."""
+    local_info = get_local_ip()
+    if "error" in local_info:
+        return local_info
+
+    devices = []
+    
+    for iface in local_info.get("interfaces", []):
+        ip = iface.get("ip", "")
+        netmask = iface.get("netmask", "")
+        if not ip or not netmask:
+            continue
+        
+        try:
+            ip_parts = list(map(int, ip.split(".")))
+            mask_parts = list(map(int, netmask.split(".")))
+            network = [ip_parts[i] & mask_parts[i] for i in range(4)]
+            broadcast = [network[i] | (~mask_parts[i] & 0xFF) for i in range(4)]
+            if broadcast[3] < 2:
+                continue
+        except (ValueError, IndexError):
+            continue
+
+        def _ping(host: str) -> str | None:
+            try:
+                r = subprocess.run(
+                    ["ping", "-n", "1", "-w", str(int(timeout * 1000)), host],
+                    capture_output=True, text=True, timeout=5
+                )
+                if r.returncode == 0:
+                    return host
+            except Exception:
+                pass
+            return None
+
+        hosts = [f"{network[0]}.{network[1]}.{network[2]}.{i}" for i in range(1, broadcast[3])]
+        with ThreadPoolExecutor(max_workers=50) as ex:
+            futuros = {ex.submit(_ping, h): h for h in hosts}
+            for fut in as_completed(futuros):
+                r = fut.result()
+                if r:
+                    try:
+                        hostname = socket.gethostbyaddr(r)[0]
+                    except Exception:
+                        hostname = ""
+                    devices.append({"ip": r, "hostname": hostname, "interface": iface["name"]})
+
+    try:
+        arp = subprocess.run(["arp", "-a"], capture_output=True, text=True, timeout=10)
+        for line in arp.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[0].count(".") == 3:
+                ip = parts[0]
+                mac = parts[1]
+                if ip not in [d["ip"] for d in devices]:
+                    try:
+                        hostname = socket.gethostbyaddr(ip)[0]
+                    except Exception:
+                        hostname = ""
+                    devices.append({"ip": ip, "hostname": hostname, "mac": mac, "source": "arp"})
+    except Exception:
+        pass
+
+    return {
+        "local": local_info,
+        "devices": devices,
+        "total": len(devices),
+    }
+
+def scan_wifi_networks(_target: str | None = None) -> dict:
+    """Lista redes WiFi disponibles usando netsh (Windows)."""
+    try:
+        r = subprocess.run(
+            ["netsh", "wlan", "show", "networks"],
+            capture_output=True, text=True, timeout=15
+        )
+        if r.returncode != 0:
+            return {"error": "No se pudo escanear WiFi. ¿Está habilitado el adaptador?", "raw": r.stderr.strip()}
+        
+        networks = []
+        current = {}
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("SSID"):
+                if current:
+                    networks.append(current)
+                current = {"ssid": "", "signal": "", "auth": "", "type": ""}
+                if ": " in line:
+                    current["ssid"] = line.split(": ", 1)[1].strip()
+            elif "BSSID" in line and ": " in line:
+                current["bssid"] = line.split(": ", 1)[1].strip()
+            elif "Tipo de radio" in line and ": " in line:
+                current["type"] = line.split(": ", 1)[1].strip()
+            elif "Autenticaci" in line and ": " in line:
+                current["auth"] = line.split(": ", 1)[1].strip()
+            elif "Se" in line and "al" in line and ": " in line:
+                current["signal"] = line.split(": ", 1)[1].strip()
+        if current:
+            networks.append(current)
+
+        return {
+            "networks": networks,
+            "total": len(networks),
+        }
+    except FileNotFoundError:
+        return {"error": "netsh no disponible (no es Windows o está bloqueado)"}
+    except subprocess.TimeoutExpired:
+        return {"error": "Timeout escaneando redes WiFi"}
+    except Exception as e:
+        return {"error": str(e)}
+
 def whois_lookup(target: str) -> str:
     try:
         r = subprocess.run(["whois", target], capture_output=True, text=True, timeout=15)
