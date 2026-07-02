@@ -22,16 +22,34 @@ def get_client():
         _httpx_client = httpx.Client(timeout=OPENROUTER_TIMEOUT)
     return _httpx_client
 
+_last_request_time = 0.0
+REQUEST_INTERVAL = float(os.getenv("OPENROUTER_MIN_INTERVAL", "6"))
+
+def _throttle():
+    global _last_request_time
+    now = time.time()
+    elapsed = now - _last_request_time
+    if elapsed < REQUEST_INTERVAL:
+        wait = REQUEST_INTERVAL - elapsed
+        log.debug(f"Throttling {wait:.1f}s between requests")
+        time.sleep(wait)
+    _last_request_time = time.time()
+
 def _retry(fn, max_retries=None):
     max_retries = max_retries or OPENROUTER_MAX_RETRIES
     last_err = RuntimeError("Max retries agotados")
     for attempt in range(max_retries + 1):
         try:
+            _throttle()
             return fn()
         except httpx.HTTPStatusError as e:
             last_err = e
             if e.response.status_code == 429 and attempt < max_retries:
-                wait = min(2 ** (attempt + 2), 60)
+                retry_after = e.response.headers.get("Retry-After")
+                if retry_after:
+                    wait = int(retry_after)
+                else:
+                    wait = min(2 ** (attempt + 3), 120)
                 log.warning(f"Rate limit (429), esperando {wait}s (intento {attempt + 1}/{max_retries})")
                 time.sleep(wait)
             else:
@@ -39,7 +57,7 @@ def _retry(fn, max_retries=None):
         except (httpx.TimeoutException, httpx.RequestError) as e:
             last_err = e
             if attempt < max_retries:
-                wait = 2 ** attempt
+                wait = min(2 ** (attempt + 1), 30)
                 log.warning(f"Reintento {attempt + 1}/{max_retries} en {wait}s: {e}")
                 time.sleep(wait)
             else:
