@@ -3,32 +3,39 @@ import json
 import time
 import httpx
 import logging
-from pathlib import Path
 from typing import Generator
 
 log = logging.getLogger("artenisa.llama")
 
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-MODEL_NAME = os.getenv("MODEL_NAME", "personal")
-OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "180"))
-OLLAMA_MAX_RETRIES = int(os.getenv("OLLAMA_MAX_RETRIES", "1"))
-OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "768"))
-OLLAMA_STOP_TOKENS = [token.strip() for token in os.getenv("OLLAMA_STOP_TOKENS", "").split(",") if token.strip()]
+OPENROUTER_URL = os.getenv("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemma-4-26b-a4b-it:free")
+OPENROUTER_TIMEOUT = int(os.getenv("OPENROUTER_TIMEOUT", "180"))
+OPENROUTER_MAX_RETRIES = int(os.getenv("OPENROUTER_MAX_RETRIES", "5"))
+OPENROUTER_NUM_PREDICT = int(os.getenv("OPENROUTER_NUM_PREDICT", "8192"))
 
 _httpx_client = None
 
 def get_client():
     global _httpx_client
     if _httpx_client is None:
-        _httpx_client = httpx.Client(timeout=OLLAMA_TIMEOUT)
+        _httpx_client = httpx.Client(timeout=OPENROUTER_TIMEOUT)
     return _httpx_client
 
 def _retry(fn, max_retries=None):
-    max_retries = max_retries or OLLAMA_MAX_RETRIES
-    last_err = None
+    max_retries = max_retries or OPENROUTER_MAX_RETRIES
+    last_err = RuntimeError("Max retries agotados")
     for attempt in range(max_retries + 1):
         try:
             return fn()
+        except httpx.HTTPStatusError as e:
+            last_err = e
+            if e.response.status_code == 429 and attempt < max_retries:
+                wait = min(2 ** (attempt + 2), 60)
+                log.warning(f"Rate limit (429), esperando {wait}s (intento {attempt + 1}/{max_retries})")
+                time.sleep(wait)
+            else:
+                raise
         except (httpx.TimeoutException, httpx.RequestError) as e:
             last_err = e
             if attempt < max_retries:
@@ -39,56 +46,59 @@ def _retry(fn, max_retries=None):
                 raise
     raise last_err
 
-def check_model() -> bool:
-    try:
-        r = get_client().get(f"{OLLAMA_URL}/api/tags", timeout=5)
-        return r.status_code == 200
-    except httpx.HTTPError:
-        return False
+def _headers():
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if OPENROUTER_API_KEY:
+        headers["Authorization"] = f"Bearer {OPENROUTER_API_KEY}"
+    return headers
 
-OLLAMA_OPTIONS = {
-    "num_predict": OLLAMA_NUM_PREDICT,
-    "temperature": 0.85,
-}
-if OLLAMA_STOP_TOKENS:
-    OLLAMA_OPTIONS["stop"] = OLLAMA_STOP_TOKENS
+def _payload(prompt: str, temperature: float, stream: bool = False) -> dict:
+    return {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": temperature,
+        "max_tokens": OPENROUTER_NUM_PREDICT,
+        "stream": stream,
+    }
 
 def generate(prompt: str, temperature: float = 0.85) -> str:
     client = get_client()
     def _do_generate():
-        options = {**OLLAMA_OPTIONS, "temperature": temperature}
-        resp = client.post(f"{OLLAMA_URL}/api/generate", json={
-            "model": MODEL_NAME,
-            "prompt": prompt,
-            "stream": False,
-            "options": options
-        }, timeout=OLLAMA_TIMEOUT)
+        resp = client.post(
+            OPENROUTER_URL,
+            json=_payload(prompt, temperature, stream=False),
+            headers=_headers(),
+            timeout=OPENROUTER_TIMEOUT
+        )
         resp.raise_for_status()
-        return resp.json().get("response", "").strip()
+        data = resp.json()
+        choices = data.get("choices", [])
+        if choices:
+            content = choices[0].get("message", {}).get("content", "")
+            return content.strip()
+        return ""
     try:
         return _retry(_do_generate)
     except httpx.TimeoutException:
-        raise TimeoutError("Timeout del modelo")
+        raise TimeoutError("Timeout del modelo OpenRouter")
     except httpx.RequestError as e:
-        raise RuntimeError(f"Error conectando con Ollama: {e}")
+        raise RuntimeError(f"Error conectando con OpenRouter: {e}")
     except Exception as e:
         raise RuntimeError(f"Error: {e}")
 
 def generate_stream(prompt: str, temperature: float = 0.85) -> Generator[str, None, None]:
-    """Genera tokens uno por uno usando streaming SSE de Ollama."""
     client = get_client()
     def _do_stream():
-        options = {**OLLAMA_OPTIONS, "temperature": temperature}
         with client.stream(
             "POST",
-            f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": MODEL_NAME,
-                "prompt": prompt,
-                "stream": True,
-                "options": options
-            },
-            timeout=OLLAMA_TIMEOUT
+            OPENROUTER_URL,
+            json=_payload(prompt, temperature, stream=True),
+            headers=_headers(),
+            timeout=OPENROUTER_TIMEOUT
         ) as resp:
             resp.raise_for_status()
             tokens = []
@@ -98,33 +108,28 @@ def generate_stream(prompt: str, temperature: float = 0.85) -> Generator[str, No
                 line = line.strip()
                 if not line:
                     continue
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                if data_str == "[DONE]":
+                    break
                 try:
-                    obj = json.loads(line)
-                    token = obj.get("response", "")
+                    obj = json.loads(data_str)
+                    delta = obj.get("choices", [{}])[0].get("delta", {})
+                    token = delta.get("content", "")
                     if token:
                         tokens.append(token)
                         yield token
-                    if obj.get("done"):
-                        break
                 except json.JSONDecodeError:
                     continue
     try:
         yield from _retry(_do_stream)
     except httpx.TimeoutException:
-        raise TimeoutError("Timeout del modelo (streaming)")
+        raise TimeoutError("Timeout del modelo OpenRouter (streaming)")
     except httpx.RequestError as e:
-        raise RuntimeError(f"Error conectando con Ollama: {e}")
+        raise RuntimeError(f"Error conectando con OpenRouter: {e}")
     except Exception as e:
         raise RuntimeError(f"Error streaming: {e}")
 
 def list_models() -> list:
-    """Lista modelos disponibles en Ollama."""
-    try:
-        with httpx.Client(timeout=10) as c:
-            r = c.get(f"{OLLAMA_URL}/api/tags")
-            if r.status_code == 200:
-                data = r.json()
-                return [m["name"] for m in data.get("models", [])]
-    except httpx.HTTPError:
-        pass
-    return ["personal"]
+    return [OPENROUTER_MODEL]

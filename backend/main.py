@@ -58,8 +58,7 @@ if _env_path.exists():
             os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
-MODEL_NAME = os.getenv("MODEL_NAME", "personal")
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "nex-agi/nex-n2-pro:free")
 DB_PATH = os.getenv("DB_PATH", "data/conversations.db")
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "data/uploads"))
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
@@ -711,7 +710,7 @@ def root():
     return {
         "status": "ok",
         "asistente": "Artenisa",
-        "modelo": MODEL_NAME,
+        "modelo": OPENROUTER_MODEL,
         "features": ["chat", "tools", "search", "files", "memory", "voice", "web"]
     }
 
@@ -775,8 +774,15 @@ def chat_stream(req: ChatRequest, authorization: str = Header(None)):
                 full_response.append(token)
                 yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
         except Exception as e:
-            log.error(f"Error streaming: {e}")
-            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+            err_msg = str(e)
+            log.error(f"Error streaming: {err_msg}")
+            if "429" in err_msg:
+                friendly = "Límite de requests excedido (OpenRouter free). Espera unos segundos y vuelve a intentar."
+            elif "Timeout" in err_msg:
+                friendly = "El modelo tardó demasiado en responder. Intenta con un mensaje más corto."
+            else:
+                friendly = f"Error del modelo: {err_msg}"
+            yield f"data: {json.dumps({'type': 'error', 'error': friendly})}\n\n"
             return
 
         try:
@@ -1099,7 +1105,7 @@ def run_workflow_endpoint(nombre: str, params: dict = Body({}), authorization: s
 def list_models(authorization: str = Header(None)):
     verify_token(authorization)
     models = llama_backend.list_models()
-    return {"models": models, "current": MODEL_NAME}
+    return {"models": models, "current": OPENROUTER_MODEL}
 
 # ─── Health check para Docker ───
 
@@ -1107,13 +1113,43 @@ def list_models(authorization: str = Header(None)):
 def health():
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
+TOOL_ALIASES = {
+    "portscan": "scan_ports",
+    "dns": "dns_enum",
+    "subdomains": "subdomain_scan",
+    "whois": "whois_lookup",
+    "dirb": "dir_bruteforce",
+    "tech": "detect_tech",
+    "sqli": "check_sqli",
+    "xss": "check_xss",
+    "lfi": "check_lfi",
+    "ssl": "ssl_check",
+    "hashid": "hash_id",
+    "hashcrack": "hash_crack",
+    "decode64": "decode_b64",
+    "encode64": "encode_b64",
+    "base64": "encode_b64",
+    "ipgeo": "ip_geo",
+    "email": "email_osint",
+    "certs": "cert_transparency",
+    "reverseshell": "reverse_shell",
+    "webshell": "webshell",
+    "payload": "encode_payload",
+}
+
 # ─── V5 Endpoints ───
 
 @_rate_limiter.wrap
-@app.get("/v5/target")
-def v5_get_target(authorization: str = Header(None)):
+@app.get("/v5/target/{user_id}")
+def v5_get_target(user_id: int, authorization: str = Header(None)):
     verify_token(authorization)
-    return _target_engine.get_target(0)
+    return _target_engine.get_target(user_id)
+
+@_rate_limiter.wrap
+@app.get("/v5/target/{user_id}/summary")
+def v5_get_target_summary(user_id: int, authorization: str = Header(None)):
+    verify_token(authorization)
+    return {"summary": _target_engine.get_context_summary(user_id)}
 
 @_rate_limiter.wrap
 @app.post("/v5/target")
@@ -1121,8 +1157,16 @@ def v5_set_target(data: dict = Body(...), authorization: str = Header(None)):
     verify_token(authorization)
     target = data.get("target", "")
     target_type = data.get("target_type", "domain")
-    _target_engine.set_target(0, target, target_type)
-    return {"status": "ok", "target": target, "target_type": target_type}
+    user_id = data.get("user_id", 0)
+    _target_engine.set_target(user_id, target, target_type)
+    return {"status": "ok", "target": target, "target_type": target_type, "user_id": user_id}
+
+@_rate_limiter.wrap
+@app.delete("/v5/target/{user_id}")
+def v5_clear_target(user_id: int, authorization: str = Header(None)):
+    verify_token(authorization)
+    _target_engine.clear_target(user_id)
+    return {"status": "ok", "user_id": user_id}
 
 @_rate_limiter.wrap
 @app.get("/v5/playbooks")
@@ -1136,7 +1180,9 @@ def v5_run_playbook(name: str, data: dict = Body(...), authorization: str = Head
     verify_token(authorization)
     target = data.get("target", "")
     depth = data.get("depth", "rapido")
-    task_id = _task_queue.submit(name, target=target, depth=depth)
+    creador = data.get("creador", "api")
+    task_id = _task_queue.submit(name, target=target, params={"playbook": name, "depth": depth})
+    _audit_log.log(0, creador, f"playbook:{name}", target=target, status="ok", details=f"task:{task_id}")
     return {"task_id": task_id, "status": "queued"}
 
 @_rate_limiter.wrap
@@ -1152,10 +1198,25 @@ def v5_get_task(task_id: str, authorization: str = Header(None)):
     return _task_queue.get_status(task_id)
 
 @_rate_limiter.wrap
+@app.post("/v5/tasks")
+def v5_submit_task(data: dict = Body(...), authorization: str = Header(None)):
+    verify_token(authorization)
+    playbook = data.get("playbook", "")
+    target = data.get("target", "")
+    depth = data.get("depth", "rapido")
+    creador = data.get("creador", "api")
+    if not playbook or not target:
+        raise HTTPException(400, "playbook y target son requeridos")
+    task_id = _task_queue.submit(playbook, target=target, params={"playbook": playbook, "depth": depth})
+    _audit_log.log(0, creador, f"task:{playbook}", target=target, status="queued", details=f"task:{task_id}")
+    return {"task_id": task_id, "status": "queued", "playbook": playbook, "target": target}
+
+@_rate_limiter.wrap
 @app.post("/v5/tasks/{task_id}/cancel")
 def v5_cancel_task(task_id: str, authorization: str = Header(None)):
     verify_token(authorization)
-    return {"status": "cancelled"}
+    ok = _task_queue.cancel(task_id)
+    return {"status": "cancelled" if ok else "not_found"}
 
 @_rate_limiter.wrap
 @app.post("/v5/report")
@@ -1163,9 +1224,10 @@ def v5_generate_report(data: dict = Body(...), authorization: str = Header(None)
     verify_token(authorization)
     target = data.get("target", "")
     fmt = data.get("format", "md")
-    results = data.get("results", [])
+    results = data.get("data", data.get("results", []))
     playbook = data.get("playbook", "")
-    report = generate_report(target, fmt, results, playbook)
+    payload = {"results": results, "playbook": playbook}
+    report = generate_report(target, payload, fmt)
     return report
 
 @_rate_limiter.wrap
@@ -1173,12 +1235,42 @@ def v5_generate_report(data: dict = Body(...), authorization: str = Header(None)
 def v5_hacking_tool(tool: str, data: dict = Body(...), authorization: str = Header(None)):
     verify_token(authorization)
     target = data.get("target", "")
+    hash_val = data.get("hash", "")
+    text = data.get("text", "")
+    ip = data.get("ip", "")
+    port = data.get("port", 0)
+    shell_type = data.get("shell_type", "bash")
+    language = data.get("language", "php")
+    param = data.get("param", "q")
     try:
-        tool_fn = getattr(hacking, tool)
-        result = tool_fn(target)
+        real_name = TOOL_ALIASES.get(tool, tool)
+        tool_fn = getattr(hacking, real_name, None)
+        if tool_fn is None:
+            raise HTTPException(404, f"Herramienta '{tool}' no encontrada")
+
+        if tool in ("hashcrack",):
+            result = tool_fn(hash_val or target)
+        elif tool in ("decode64",):
+            result = tool_fn(text or target)
+        elif tool in ("encode64", "base64"):
+            result = tool_fn(text or target)
+        elif tool in ("hashid",):
+            result = tool_fn(hash_val or target)
+        elif tool in ("reverseshell",):
+            result = tool_fn(ip or target, int(port or 4444), shell_type)
+        elif tool in ("webshell",):
+            result = tool_fn(language)
+        elif tool in ("ipgeo",):
+            result = tool_fn(ip or target)
+        elif tool in ("portscan",):
+            ports = data.get("ports", "22,80,443")
+            timeout = data.get("timeout", 3)
+            result = tool_fn(target, ports, timeout)
+        else:
+            result = tool_fn(target)
         return {"tool": tool, "target": target, "result": result}
-    except AttributeError:
-        raise HTTPException(404, f"Herramienta '{tool}' no encontrada")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, f"Error ejecutando {tool}: {e}")
 
@@ -1193,7 +1285,7 @@ def v5_get_audit(authorization: str = Header(None)):
 def v5_store_operational_memory(data: dict = Body(...), authorization: str = Header(None)):
     verify_token(authorization)
     conversation_id = data.get("conversation_id", "")
-    context = data.get("context", {})
+    context = data.get("context", data.get("data", {}))
     _memory_engine.store_operational(conversation_id, context)
     return {"status": "stored", "conversation_id": conversation_id}
 
@@ -1205,7 +1297,20 @@ def v5_get_operational_memory(conv_id: str, authorization: str = Header(None)):
     return {"conversation_id": conv_id, "memory": memory}
 
 @_rate_limiter.wrap
-@app.get("/v5/memory/history/{target}")
+@app.post("/v5/memory/historical")
+def v5_store_history_memory(data: dict = Body(...), authorization: str = Header(None)):
+    verify_token(authorization)
+    target = data.get("target", "")
+    playbook = data.get("playbook", "")
+    summary = data.get("summary", "")
+    findings = data.get("findings", 0)
+    if not target:
+        raise HTTPException(400, "target requerido")
+    _memory_engine.store_historical(target=target, operation=f"playbook:{playbook}" if playbook else "manual", summary=summary, findings_count=findings)
+    return {"status": "stored", "target": target}
+
+@_rate_limiter.wrap
+@app.get("/v5/memory/historical/{target}")
 def v5_get_history_memory(target: str, authorization: str = Header(None)):
     verify_token(authorization)
     memory = _memory_engine.get_history(target)
