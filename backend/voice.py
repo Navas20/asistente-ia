@@ -17,13 +17,21 @@ async def speak(text: str, voice: str = "es-MX-DaliaNeural") -> bytes:
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 audio_data += chunk["data"]
-        return audio_data
-    except ImportError:
-        fallback_tts(text)
-        return b""
-    except Exception as e:
-        fallback_tts(text)
-        return b""
+        if audio_data:
+            return audio_data
+    except (ImportError, Exception):
+        pass
+    try:
+        import pyttsx3
+        engine = pyttsx3.init()
+        engine.save_to_file(text, "data/audio/fallback_tts.wav")
+        engine.runAndWait()
+        path = Path("data/audio/fallback_tts.wav")
+        if path.exists():
+            return path.read_bytes()
+    except (ImportError, Exception):
+        pass
+    return b""
 
 def fallback_tts(text: str):
     try:

@@ -141,7 +141,7 @@ class RateLimiter:
             @wraps(func)
             def wrapper(*args, **kwargs):
                 authorization = kwargs.get("authorization")
-                key = authorization or "global"
+                key = authorization or f"endpoint:{func.__name__}"
                 allowed, _, reset_after = self.check(key, max_calls=max_calls, window=window)
                 if not allowed:
                     raise HTTPException(429, f"Límite de peticiones excedido. Reintenta en {reset_after}s")

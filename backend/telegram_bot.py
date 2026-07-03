@@ -188,18 +188,24 @@ async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         file = await context.bot.get_file(file_id)
         file_bytes = await file.download_as_bytearray()
+        api = os.getenv("API_URL", "http://localhost:8000")
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
-                f"{API_URL}/analyze-image",
+                f"{api}/upload",
                 files={"file": ("image.jpg", file_bytes, "image/jpeg")},
                 headers={"Authorization": f"Bearer {AUTH_TOKEN}"},
             )
             if resp.status_code == 200:
                 data = resp.json()
-                result = data.get("analysis", data.get("result", "Sin resultados"))
-                await update.message.reply_text(f"\U0001f50d *An\u00e1lisis:*\n{result}", parse_mode="Markdown")
+                fid = data.get("file_id", "")
+                await update.message.reply_text(
+                    f"\U0001f4f8 Imagen subida.\n"
+                    f"ID: `{fid}`\n"
+                    f"El an\u00e1lisis por IA a\u00fan no est\u00e1 disponible.",
+                    parse_mode="Markdown"
+                )
             else:
-                await update.message.reply_text(f"\u274c Error al analizar: {resp.status_code}")
+                await update.message.reply_text(f"\u274c Error al subir: {resp.status_code}")
     except Exception as e:
         await update.message.reply_text(f"\u274c Error: {str(e)}")
 

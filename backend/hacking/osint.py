@@ -76,7 +76,7 @@ def email_osint(email: str) -> dict:
             unique = sorted(set(item["name_value"].strip() for item in data if "name_value" in item))
             result["dominio_info"]["subdominios_cert"] = unique[:50]
             result["dominio_info"]["total_certs"] = len(data)
-    except Exception:
+    except (json.JSONDecodeError, urllib.error.URLError, urllib.error.HTTPError):
         pass
     return result
 
