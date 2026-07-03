@@ -201,20 +201,52 @@ def get_local_ip(_target: str | None = None) -> dict:
         "default_gateway": default_gateway,
     }
 
-def scan_local_network(timeout: float = 1.0) -> dict:
+def _is_reachable_subnet(ip: str) -> bool:
+    """Filtra subredes no escaneables: loopback, APIPA, multicast."""
+    try:
+        first = int(ip.split(".")[0])
+        if first == 127 or first >= 224:
+            return False
+        if first == 169 and ip.split(".")[1] == "254":
+            return False
+        return True
+    except (ValueError, IndexError):
+        return False
+
+def scan_local_network(timeout: float = 0.3) -> dict:
     """Escanea la red local con ping sweep y ARP para descubrir dispositivos."""
     local_info = get_local_ip()
     if "error" in local_info:
         return local_info
 
     devices = []
-    
+    arp_ips = set()
+
+    try:
+        arp = subprocess.run(["arp", "-a"], capture_output=True, text=True, timeout=10)
+        for line in arp.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[0].count(".") == 3:
+                ip = parts[0]
+                mac = parts[1]
+                arp_ips.add(ip)
+                first_octet = int(ip.split(".")[0])
+                hostname = ""
+                if first_octet not in (0, 127, 169, 224, 239, 255) and not ip.endswith(".255"):
+                    try:
+                        hostname = socket.gethostbyaddr(ip)[0]
+                    except Exception:
+                        pass
+                devices.append({"ip": ip, "hostname": hostname, "mac": mac, "source": "arp"})
+    except Exception:
+        pass
+
     for iface in local_info.get("interfaces", []):
         ip = iface.get("ip", "")
         netmask = iface.get("netmask", "")
-        if not ip or not netmask:
+        if not ip or not netmask or not _is_reachable_subnet(ip):
             continue
-        
+
         try:
             ip_parts = list(map(int, ip.split(".")))
             mask_parts = list(map(int, netmask.split(".")))
@@ -225,11 +257,18 @@ def scan_local_network(timeout: float = 1.0) -> dict:
         except (ValueError, IndexError):
             continue
 
+        max_hosts = min(broadcast[3] - 1, 254)
+        hosts = [f"{network[0]}.{network[1]}.{network[2]}.{i}" for i in range(1, max_hosts + 1)
+                 if f"{network[0]}.{network[1]}.{network[2]}.{i}" not in arp_ips]
+
+        if not hosts:
+            continue
+
         def _ping(host: str) -> str | None:
             try:
                 r = subprocess.run(
-                    ["ping", "-n", "1", "-w", str(int(timeout * 1000)), host],
-                    capture_output=True, text=True, timeout=5
+                    ["ping", "-n", "1", "-w", str(max(100, int(timeout * 1000))), host],
+                    capture_output=True, text=True, timeout=2
                 )
                 if r.returncode == 0:
                     return host
@@ -237,33 +276,19 @@ def scan_local_network(timeout: float = 1.0) -> dict:
                 pass
             return None
 
-        hosts = [f"{network[0]}.{network[1]}.{network[2]}.{i}" for i in range(1, broadcast[3])]
         with ThreadPoolExecutor(max_workers=50) as ex:
             futuros = {ex.submit(_ping, h): h for h in hosts}
             for fut in as_completed(futuros):
                 r = fut.result()
                 if r:
-                    try:
-                        hostname = socket.gethostbyaddr(r)[0]
-                    except Exception:
-                        hostname = ""
+                    first_octet = int(r.split(".")[0])
+                    hostname = ""
+                    if first_octet not in (0, 127, 169, 224, 239, 255) and not r.endswith(".255"):
+                        try:
+                            hostname = socket.gethostbyaddr(r)[0]
+                        except Exception:
+                            pass
                     devices.append({"ip": r, "hostname": hostname, "interface": iface["name"]})
-
-    try:
-        arp = subprocess.run(["arp", "-a"], capture_output=True, text=True, timeout=10)
-        for line in arp.stdout.splitlines():
-            parts = line.split()
-            if len(parts) >= 3 and parts[0].count(".") == 3:
-                ip = parts[0]
-                mac = parts[1]
-                if ip not in [d["ip"] for d in devices]:
-                    try:
-                        hostname = socket.gethostbyaddr(ip)[0]
-                    except Exception:
-                        hostname = ""
-                    devices.append({"ip": ip, "hostname": hostname, "mac": mac, "source": "arp"})
-    except Exception:
-        pass
 
     return {
         "local": local_info,
