@@ -48,6 +48,14 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
 )
 
+# ─── Routers ───
+from findings.router import router as findings_router
+from pentest.router import router as pentest_router
+from defense.router import router as defense_router
+app.include_router(findings_router)
+app.include_router(pentest_router)
+app.include_router(defense_router)
+
 # ─── Cargar .env manualmente ───
 _env_path = Path(__file__).parent / ".env"
 if _env_path.exists():
@@ -220,13 +228,36 @@ def save_memories_batch(memories: list):
                     (key, value, now)
                 )
 
-# ─── Backend del modelo ───
+# ─── Multi-Provider ───
 
-import llama_backend
+from providers import get_provider, list_providers, PROVIDER_REGISTRY
+
+import providers.openrouter
+import providers.groq
+import providers.anthropic
+
+_current_provider_name = os.getenv("ACTIVE_PROVIDER", "openrouter")
+
+def _get_provider():
+    return get_provider(_current_provider_name)
+
+def switch_provider(name: str):
+    global _current_provider_name
+    if name not in PROVIDER_REGISTRY:
+        raise ValueError(f"Provider '{name}' no disponible")
+    _current_provider_name = name
+    os.environ["ACTIVE_PROVIDER"] = name
+
+def switch_model(model: str):
+    p = _get_provider()
+    p.switch_model(model)
 
 def call_ollama(prompt: str, model: str = None, temperature: float = 0.85) -> str:
     try:
-        return llama_backend.generate(prompt, temperature)
+        p = _get_provider()
+        if model:
+            p.switch_model(model)
+        return p.generate(prompt, temperature)
     except TimeoutError:
         raise HTTPException(504, "Timeout del modelo")
     except Exception as e:
@@ -236,7 +267,10 @@ def call_ollama(prompt: str, model: str = None, temperature: float = 0.85) -> st
 def call_ollama_safe(prompt: str, model: str = None, temperature: float = 0.85) -> str:
     """Versión segura que no lanza excepciones."""
     try:
-        return llama_backend.generate(prompt, temperature)
+        p = _get_provider()
+        if model:
+            p.switch_model(model)
+        return p.generate(prompt, temperature)
     except Exception as e:
         log.error(f"Error en modelo (safe): {e}")
         return f"[Error del modelo: {e}]"
@@ -381,6 +415,9 @@ def build_prompt(history: list, new_message: str, memories: dict) -> str:
     mem_block = format_memories(memories)
     if mem_block:
         parts.append(f"<|im_start|>system\n{mem_block}<|im_end|>")
+    jailbreak = get_system_prompt()
+    if jailbreak:
+        parts.append(f"<|im_start|>system\n{jailbreak}<|im_end|>")
     parts.append(f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>")
     for h in _prepare_history_for_prompt(history):
         role = "user" if h["role"] == "user" else "assistant"
@@ -770,7 +807,8 @@ def chat_stream(req: ChatRequest, authorization: str = Header(None)):
     def event_generator():
         full_response = []
         try:
-            for token in llama_backend.generate_stream(prompt):
+            p = _get_provider()
+            for token in p.generate_stream(prompt):
                 full_response.append(token)
                 yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
         except Exception as e:
@@ -1099,13 +1137,68 @@ def run_workflow_endpoint(nombre: str, params: dict = Body({}), authorization: s
     log.info(f"Workflow: {nombre} params={params}")
     return ejecutar_workflow(nombre, params)
 
-# ─── Modelos disponibles ───
+# ─── Multi-Provider endpoints ───
 
 @app.get("/models")
 def list_models(authorization: str = Header(None)):
     verify_token(authorization)
-    models = llama_backend.list_models()
-    return {"models": models, "current": OPENROUTER_MODEL}
+    p = _get_provider()
+    return {"models": p.list_models(), "current": p.model, "provider": _current_provider_name}
+
+@app.get("/providers")
+def list_providers_endpoint(authorization: str = Header(None)):
+    verify_token(authorization)
+    return {"providers": list_providers(), "active": _current_provider_name}
+
+@app.post("/provider")
+def set_provider(data: dict = Body(...), authorization: str = Header(None)):
+    verify_token(authorization)
+    name = data.get("provider", "")
+    try:
+        switch_provider(name)
+        p = _get_provider()
+        return {"status": "ok", "provider": name, "model": p.model}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/provider/model")
+def set_provider_model(data: dict = Body(...), authorization: str = Header(None)):
+    verify_token(authorization)
+    model = data.get("model", "")
+    if not model:
+        raise HTTPException(400, "Model name required")
+    switch_model(model)
+    return {"status": "ok", "model": model}
+
+# ─── System Prompt (jailbreak mode) ───
+
+SYSTEM_PROMPT_FILE = Path(__file__).parent / "system_prompt.md"
+_system_prompt_cache = None
+
+def get_system_prompt() -> str:
+    global _system_prompt_cache
+    if SYSTEM_PROMPT_FILE.exists():
+        _system_prompt_cache = SYSTEM_PROMPT_FILE.read_text("utf-8")
+    return _system_prompt_cache or ""
+
+@app.get("/system-prompt")
+def get_system_prompt_endpoint(authorization: str = Header(None)):
+    verify_token(authorization)
+    return {"system_prompt": get_system_prompt()}
+
+@app.post("/system-prompt")
+def set_system_prompt_endpoint(data: dict = Body(...), authorization: str = Header(None)):
+    verify_token(authorization)
+    content = data.get("content", "")
+    if content:
+        SYSTEM_PROMPT_FILE.write_text(content, encoding="utf-8")
+        global _system_prompt_cache
+        _system_prompt_cache = content
+    else:
+        if SYSTEM_PROMPT_FILE.exists():
+            SYSTEM_PROMPT_FILE.unlink()
+        _system_prompt_cache = None
+    return {"status": "ok"}
 
 # ─── Health check para Docker ───
 
