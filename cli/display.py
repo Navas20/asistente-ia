@@ -335,6 +335,12 @@ class Screen:
             ("/subagente <id>", "Subagent detail"),
             ("/subagente <id> cancel", "Cancel subagent"),
             ("", ""),
+            ("", ""),
+            ("[bold magenta]PROJECTS[/]", ""),
+            ("/proyectos", "List projects"),
+            ("/proyecto <name>", "Create project"),
+            ("/activar <id>", "Set active project"),
+            ("", ""),
             ("[bold #b380ff]GENERAL[/]", ""),
             ("/salir", "Exit"),
         ]

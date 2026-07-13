@@ -335,6 +335,36 @@ def main():
                     screen.log(f"[SYSTEM]Finding {fid} verified")
                     continue
 
+                # ── Projects ──
+                if cmd_lower == "/proyectos":
+                    data = api_get("/projects")
+                    if isinstance(data, list) and data:
+                        active = api_get("/projects/active").get("id", "")
+                        for p in data:
+                            marker = " ✅" if p.get("id") == active else ""
+                            screen.log(f"[SYSTEM]  {p.get('name','?')}{marker} [{p.get('status','?')}] target={p.get('target','?')} findings={p.get('findings_count',0)}")
+                    else:
+                        screen.log("[SYSTEM]No projects")
+                    continue
+
+                if cmd_lower.startswith("/proyecto "):
+                    name = msg.split(" ", 1)[1].strip()
+                    data = api_post("/projects", {"name": name})
+                    if "id" in data:
+                        screen.log(f"[SYSTEM]📁 Project '{name}' created ({data['id']})")
+                    else:
+                        screen.log(f"[ERROR]{data}")
+                    continue
+
+                if cmd_lower.startswith("/activar "):
+                    pid = msg.split(" ", 1)[1].strip()
+                    data = api_post(f"/projects/{pid}/activate", {})
+                    if "id" in data:
+                        screen.log(f"[SYSTEM]✅ Active project: {data.get('name','?')}")
+                    else:
+                        screen.log(f"[ERROR]Project not found")
+                    continue
+
                 # ── Defense ──
                 if cmd_lower == "/defense":
                     data = api_get("/defense/status")
