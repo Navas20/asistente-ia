@@ -1,13 +1,17 @@
 import json
+import os
+import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .models import SubagentTask
 
 TASKS_FILE = Path("data/subagents.json")
-MAX_CONCURRENT = 3
+MAX_CONCURRENT = int(os.getenv("MAX_SUBAGENTS", "10"))
+MAX_QUEUED = int(os.getenv("MAX_QUEUED_SUBAGENTS", "50"))
 
 
 class SubagentManager:
@@ -15,7 +19,35 @@ class SubagentManager:
         self._tasks: list[SubagentTask] = []
         self._lock = threading.Lock()
         self._running: dict[str, threading.Thread] = {}
+        self._pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT, thread_name_prefix="subagent")
+        self._pending_queue = queue.Queue(maxsize=MAX_QUEUED)
+        self._queue_worker_running = False
         self._load()
+        self._start_queue_worker()
+
+    def _start_queue_worker(self):
+        if self._queue_worker_running:
+            return
+        self._queue_worker_running = True
+        def _worker():
+            while self._queue_worker_running:
+                try:
+                    task_id, task = self._pending_queue.get(timeout=2)
+                    with self._lock:
+                        active = sum(1 for t in self._tasks if t.status == "running")
+                        if active < MAX_CONCURRENT:
+                            task.status = "running"
+                            self._save()
+                            future = self._pool.submit(self._run_task, task_id)
+                            future.add_done_callback(lambda f: self._pending_queue.task_done())
+                        else:
+                            self._pending_queue.put((task_id, task))
+                except queue.Empty:
+                    continue
+                except Exception:
+                    pass
+        t = threading.Thread(target=_worker, daemon=True, name="subagent-queue")
+        t.start()
 
     def _load(self):
         if TASKS_FILE.exists():
@@ -34,26 +66,25 @@ class SubagentManager:
                provider: str = "openrouter", parent_id: str = "") -> SubagentTask:
         with self._lock:
             active = sum(1 for t in self._tasks if t.status == "running")
-            if active >= MAX_CONCURRENT:
-                t = SubagentTask(
-                    name=name, target=target, task=task,
-                    model=model, provider=provider, parent_id=parent_id,
-                    status="pending", error="Max concurrent limit reached"
-                )
-                self._tasks.append(t)
-                self._save()
-                return t
             t = SubagentTask(
                 name=name, target=target, task=task,
                 model=model, provider=provider, parent_id=parent_id,
-                status="running", progress=0
+                status="running" if active < MAX_CONCURRENT else "pending",
+                progress=0
             )
             self._tasks.append(t)
             self._save()
-            thread = threading.Thread(target=self._run_task, args=(t.id,), daemon=True)
-            self._running[t.id] = thread
-            thread.start()
-            return t
+
+        if t.status == "running":
+            future = self._pool.submit(self._run_task, t.id)
+        else:
+            try:
+                self._pending_queue.put_nowait((t.id, t))
+            except queue.Full:
+                t.status = "failed"
+                t.error = "Queue full (max queued reached)"
+                self._save()
+        return t
 
     def _run_task(self, task_id: str):
         task = self._get(task_id)
@@ -110,11 +141,7 @@ class SubagentManager:
 
     def cancel(self, task_id: str) -> bool:
         t = self._get(task_id)
-        if t and t.status == "running":
-            t.status = "cancelled"
-            self._save()
-            return True
-        if t and t.status == "pending":
+        if t and t.status in ("running", "pending"):
             t.status = "cancelled"
             self._save()
             return True
@@ -122,3 +149,21 @@ class SubagentManager:
 
     def running_count(self) -> int:
         return sum(1 for t in self._tasks if t.status == "running")
+
+    def stats(self) -> dict:
+        all_t = self._tasks
+        return {
+            "total": len(all_t),
+            "running": sum(1 for t in all_t if t.status == "running"),
+            "pending": sum(1 for t in all_t if t.status == "pending"),
+            "completed": sum(1 for t in all_t if t.status == "completed"),
+            "failed": sum(1 for t in all_t if t.status == "failed"),
+            "cancelled": sum(1 for t in all_t if t.status == "cancelled"),
+            "max_concurrent": MAX_CONCURRENT,
+            "pool_size": self._pool._max_workers,
+            "queue_size": self._pending_queue.qsize(),
+        }
+
+    def stop(self):
+        self._queue_worker_running = False
+        self._pool.shutdown(wait=False)

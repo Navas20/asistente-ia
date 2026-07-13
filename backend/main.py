@@ -405,6 +405,7 @@ HERRAMIENTAS DISPONIBLES (escribe el comando exacto en tu respuesta para usarlas
 !diff: ruta              - Muestra cambios sin commit (git diff)
 !crear: tipo nombre      - Crea proyecto desde template (python, fastapi, react, cli)
 !github: comando args    - GitHub: repos, issues, prs, create_issue, create_pr, status
+!navegar: url acción     - Navega sitios web (html, screenshot, links, click selector, fill selector valor)
 !buscar: consulta        - Busca en internet
 !grep: patrón ruta       - Busca texto en archivos
 !glob: patrón            - Encuentra archivos por nombre
@@ -474,6 +475,7 @@ TOOL_REVISAR_RE = re.compile(r'!revisar:\s*(.+)', re.IGNORECASE)
 TOOL_DIFF_RE = re.compile(r'!diff:\s*(.+)', re.IGNORECASE)
 TOOL_CREAR_RE = re.compile(r'!crear:\s*(.+)', re.IGNORECASE)
 TOOL_GITHUB_RE = re.compile(r'!github:\s*(.+)', re.IGNORECASE)
+TOOL_NAVEGAR_RE = re.compile(r'!navegar:\s*(.+)', re.IGNORECASE)
 TOOL_PREGUNTAR_RE = re.compile(r'!preguntar:\s*(.+)', re.IGNORECASE)
 TOOL_TAREAS_RE = re.compile(r'!tareas:\s*(.+)', re.IGNORECASE)
 TOOL_EXPLORAR_RE = re.compile(r'!explorar:\s*(.+)', re.IGNORECASE)
@@ -513,6 +515,8 @@ def parse_tool_commands(text: str) -> list:
         commands.append(("crear", m.group(1).strip()))
     for m in TOOL_GITHUB_RE.finditer(text):
         commands.append(("github", m.group(1).strip()))
+    for m in TOOL_NAVEGAR_RE.finditer(text):
+        commands.append(("navegar", m.group(1).strip()))
     for m in TOOL_GREP_RE.finditer(text):
         commands.append(("grep", m.group(1).strip()))
     for m in TOOL_GLOB_RE.finditer(text):
@@ -798,6 +802,7 @@ TOOL_HANDLERS = {
     "diff": lambda arg: _exec_httpx("tools/diff", {"path": arg}),
     "crear": lambda arg: _exec_httpx("tools/scaffold", {"arg": arg}),
     "github": lambda arg: _handle_github(arg),
+    "navegar": lambda arg: _exec_httpx("tools/browse", {"arg": arg}),
     "explorar": lambda arg: _exec_httpx("tools/explore", {"path": arg}),
     "preguntar": lambda arg: {"tipo": "pregunta", "pregunta": arg, "esperando": True},
     "tareas": lambda arg: _handle_tareas(arg),
@@ -935,6 +940,11 @@ def process_tool_commands(response_text: str) -> tuple:
         m_github = TOOL_GITHUB_RE.match(line)
         if m_github:
             result = TOOL_HANDLERS["github"](m_github.group(1).strip())
+            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
+            continue
+        m_navegar = TOOL_NAVEGAR_RE.match(line)
+        if m_navegar:
+            result = TOOL_HANDLERS["navegar"](m_navegar.group(1).strip())
             tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
             continue
 
@@ -1365,6 +1375,63 @@ async def tool_scaffold(data: dict = Body({}), authorization: str = Header(None)
         return {"template": template_name, "project": project_name, "files": created, "path": str(base.resolve())}
     except Exception as e:
         raise HTTPException(500, f"Error creando proyecto: {e}")
+
+
+async def _run_browser(url: str, action: str) -> dict:
+    from playwright.async_api import async_playwright
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page(viewport={"width": 1280, "height": 720})
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+        if action == "screenshot":
+            screenshot = await page.screenshot()
+            import base64
+            b64 = base64.b64encode(screenshot).decode()
+            await browser.close()
+            return {"url": url, "screenshot": f"data:image/png;base64,{b64[:500]}", "size": len(screenshot)}
+
+        if action == "html":
+            title = await page.title()
+            text = await page.inner_text("body")
+            await browser.close()
+            return {"url": url, "title": title, "text": text[:5000]}
+
+        if action.startswith("click "):
+            selector = action[6:]
+            await page.click(selector)
+            await browser.close()
+            return {"url": url, "action": f"click {selector}", "status": "clicked"}
+
+        if action.startswith("fill "):
+            fill_parts = action[5:].split(" ", 1)
+            if len(fill_parts) >= 2:
+                selector, value = fill_parts[0], fill_parts[1]
+                await page.fill(selector, value)
+                await browser.close()
+                return {"url": url, "action": f"fill {selector}", "status": "filled"}
+
+        if action == "links":
+            links = await page.eval_on_selector_all("a[href]", "els => els.map(e => ({text: e.innerText.trim(), href: e.href}))")
+            await browser.close()
+            return {"url": url, "links": links[:50]}
+
+        title = await page.title()
+        await browser.close()
+        return {"url": url, "title": title}
+
+
+@app.post("/tools/browse")
+async def tool_browse(data: dict = Body({}), authorization: str = Header(None)):
+    verify_token(authorization)
+    arg = data.get("arg", "")
+    try:
+        parts = arg.split(" ", 1)
+        url = parts[0].strip()
+        action = parts[1].strip().lower() if len(parts) > 1 else "html"
+        return await _run_browser(url, action)
+    except Exception as e:
+        raise HTTPException(500, f"Error navegando: {e}")
 
 
 @app.post("/tools/interrupt")

@@ -43,3 +43,8 @@ def cancel_subagent(task_id: str):
 @router.get("/running/count")
 def running_count():
     return {"count": manager.running_count()}
+
+
+@router.get("/stats/overview")
+def subagent_stats():
+    return manager.stats()
