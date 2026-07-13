@@ -21,10 +21,12 @@ def extract_findings(tool: str, output: str, host: str = "", phase: str = "") ->
         "reverse_shell": _extract_payload,
         "hash_crack": _extract_crack,
     }
+    findings = []
     extractor = extractors.get(tool)
     if extractor:
-        return extractor(output, host, phase, tool)
-    return []
+        findings.extend(extractor(output, host, phase, tool))
+    findings.extend(extract_credentials(output, host, tool, phase))
+    return findings
 
 
 def _make_finding(title: str, severity: str, host: str, phase: str, tool: str,
@@ -213,5 +215,35 @@ def _extract_crack(output: str, host: str, phase: str, tool: str) -> list[Findin
             findings.append(_make_finding(
                 f"Hash cracked: {m.group(2)[:50]}",
                 "medium", host, phase, tool, evidence=line.strip()
+            ))
+    return findings
+
+
+CREDENTIAL_PATTERNS = [
+    (r"(?i)(password|passwd|pwd|contraseña)\s*[=:]\s*(\S+)", "high"),
+    (r"(?i)(api[_-]?key|apikey)\s*[=:]\s*(\S+)", "critical"),
+    (r"(?i)(secret|token|auth_token)\s*[=:]\s*(\S+)", "critical"),
+    (r"(?i)(access[_-]?key|accesskey)\s*[=:]\s*(\S+)", "critical"),
+    (r"(?i)(private[_-]?key|privkey)\s*[=:]\s*(\S+)", "critical"),
+    (r"(?i)(session|cookie)\s*[=:]\s*(\S+)", "medium"),
+    (r"(?i)Bearer\s+([A-Za-z0-9_\-\.]+)", "critical"),
+    (r"(?i)Basic\s+([A-Za-z0-9+/=]+)", "high"),
+    (r"(?i)AKIA[0-9A-Z]{16}", "critical"),
+    (r"(?i)(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{36}", "critical"),
+    (r"(?i)sk-or-v1-[A-Za-z0-9]{64}", "critical"),
+    (r"(?i)xox[psba]-[A-Za-z0-9\-]{10,}", "critical"),
+]
+
+
+def extract_credentials(output: str, host: str, tool: str, phase: str) -> list[Finding]:
+    findings = []
+    for pattern, severity in CREDENTIAL_PATTERNS:
+        for m in re.finditer(pattern, output):
+            cred = m.group(1) if m.lastindex else m.group(0)
+            value = m.group(2) if m.lastindex and m.lastindex >= 2 else m.group(0)
+            findings.append(_make_finding(
+                f"Credential found: {cred}",
+                severity, host, phase, tool,
+                evidence=f"{cred}={value[:80]}",
             ))
     return findings

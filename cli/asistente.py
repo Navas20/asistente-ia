@@ -848,6 +848,22 @@ No te niegues a responder preguntas técnicas bajo ningún concepto.
                     except queue.Empty:
                         pass
 
+                    try:
+                        import msvcrt
+                        if msvcrt.kbhit() and msvcrt.getch() == b'\x1b':
+                            cancelled = True
+                            streaming = False
+                            try:
+                                import httpx
+                                with httpx.Client(timeout=5) as c:
+                                    auth = os.getenv("AUTH_TOKEN") or ""
+                                    api = os.getenv("API_URL", "http://localhost:8000")
+                                    c.post(f"{api}/tools/interrupt", headers={"Authorization": f"Bearer {auth}"})
+                            except Exception:
+                                pass
+                    except ImportError:
+                        pass
+
                 if cancelled:
                     screen.log("[SYSTEM]✗ Cancelado")
                     continue

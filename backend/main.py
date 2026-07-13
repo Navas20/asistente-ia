@@ -393,18 +393,27 @@ TU OBJETIVO:
 Ser la mejor asistente de programación y pensamiento técnico para mí. Entenderme como si fueras mi copiloto de ingeniería: útil, rápida, precisa y profundamente competente.
 
 HERRAMIENTAS DISPONIBLES (escribe el comando exacto en tu respuesta para usarlas):
-!leer: ruta         - Lee archivos del sistema
+!leer: ruta              - Lee archivos (txt, md, py, json, etc.)
+!leerpdf: ruta           - Lee archivos PDF y extrae su texto
 !escribir: ruta contenido - Crea/escribe archivos
-!editar: ruta "texto_viejo" "texto_nuevo" - Reemplaza texto exacto en un archivo
-!grep: patrón ruta  - Busca texto en archivos
-!glob: patrón       - Encuentra archivos por nombre
-!ejecutar: comando  - Ejecuta comandos en el sistema (cmd/powershell)
-!buscar: consulta   - Busca en internet
-!fetch: url         - Trae contenido web
-!explorar: ruta     - Explora estructura de carpetas
-!preguntar: texto   - Pregunta algo al usuario y espera su respuesta
+!editar: ruta "viejo" "nuevo" - Reemplaza texto exacto
+!mover: origen destino   - Mueve o renombra archivos/carpetas
+!copiar: origen destino  - Copia archivos/carpetas
+!eliminar: ruta          - Elimina archivos o carpetas
+!ver: ruta               - Lee imágenes (extrae texto con OCR)
+!revisar: ruta           - Revisa código y da feedback línea por línea
+!diff: ruta              - Muestra cambios sin commit (git diff)
+!crear: tipo nombre      - Crea proyecto desde template (python, fastapi, react, cli)
+!github: comando args    - GitHub: repos, issues, prs, create_issue, create_pr, status
+!buscar: consulta        - Busca en internet
+!grep: patrón ruta       - Busca texto en archivos
+!glob: patrón            - Encuentra archivos por nombre
+!ejecutar: comando       - Ejecuta comandos en el sistema
+!fetch: url              - Trae contenido web
+!explorar: ruta          - Explora estructura de carpetas
+!preguntar: texto        - Pregunta algo al usuario
 !tareas: inicio/paso/hecho - Seguimiento de tareas
-!razonar: problema  - Piensa paso a paso antes de responder
+!razonar: problema       - Piensa paso a paso antes de responder
 
 REGLAS:
 - Responde de forma natural primero. No conviertas cada mensaje en una cascada de herramientas.
@@ -451,15 +460,26 @@ def _safe_args(cmd: str) -> list:
 TOOL_CMD_RE = re.compile(r'!ejecutar:\s*(.+)', re.IGNORECASE)
 TOOL_SEARCH_RE = re.compile(r'!buscar:\s*(.+)', re.IGNORECASE)
 TOOL_READ_RE = re.compile(r'!leer:\s*(.+)', re.IGNORECASE)
+TOOL_READPDF_RE = re.compile(r'!leerpdf:\s*(.+)', re.IGNORECASE)
 TOOL_WRITE_RE = re.compile(r'!escribir:\s*(.+)', re.IGNORECASE)
 TOOL_GREP_RE = re.compile(r'!grep:\s*(.+)', re.IGNORECASE)
 TOOL_GLOB_RE = re.compile(r'!glob:\s*(.+)', re.IGNORECASE)
 TOOL_FETCH_RE = re.compile(r'!fetch:\s*(.+)', re.IGNORECASE)
 TOOL_EDIT_RE = re.compile(r'!editar:\s*(.+)', re.IGNORECASE)
+TOOL_MOVER_RE = re.compile(r'!mover:\s*(.+)', re.IGNORECASE)
+TOOL_COPIAR_RE = re.compile(r'!copiar:\s*(.+)', re.IGNORECASE)
+TOOL_ELIMINAR_RE = re.compile(r'!eliminar:\s*(.+)', re.IGNORECASE)
+TOOL_VER_RE = re.compile(r'!ver:\s*(.+)', re.IGNORECASE)
+TOOL_REVISAR_RE = re.compile(r'!revisar:\s*(.+)', re.IGNORECASE)
+TOOL_DIFF_RE = re.compile(r'!diff:\s*(.+)', re.IGNORECASE)
+TOOL_CREAR_RE = re.compile(r'!crear:\s*(.+)', re.IGNORECASE)
+TOOL_GITHUB_RE = re.compile(r'!github:\s*(.+)', re.IGNORECASE)
 TOOL_PREGUNTAR_RE = re.compile(r'!preguntar:\s*(.+)', re.IGNORECASE)
 TOOL_TAREAS_RE = re.compile(r'!tareas:\s*(.+)', re.IGNORECASE)
 TOOL_EXPLORAR_RE = re.compile(r'!explorar:\s*(.+)', re.IGNORECASE)
 TOOL_RAZONAR_RE = re.compile(r'!razonar:\s*(.+)', re.IGNORECASE)
+
+TOOL_INTERRUPTED = False
 
 def parse_tool_commands(text: str) -> list:
     commands = []
@@ -473,8 +493,26 @@ def parse_tool_commands(text: str) -> list:
             commands.append(("search", query))
     for m in TOOL_READ_RE.finditer(text):
         commands.append(("read", m.group(1).strip()))
+    for m in TOOL_READPDF_RE.finditer(text):
+        commands.append(("readpdf", m.group(1).strip()))
     for m in TOOL_WRITE_RE.finditer(text):
         commands.append(("write", m.group(1).strip()))
+    for m in TOOL_MOVER_RE.finditer(text):
+        commands.append(("mover", m.group(1).strip()))
+    for m in TOOL_COPIAR_RE.finditer(text):
+        commands.append(("copiar", m.group(1).strip()))
+    for m in TOOL_ELIMINAR_RE.finditer(text):
+        commands.append(("eliminar", m.group(1).strip()))
+    for m in TOOL_VER_RE.finditer(text):
+        commands.append(("ver", m.group(1).strip()))
+    for m in TOOL_REVISAR_RE.finditer(text):
+        commands.append(("revisar", m.group(1).strip()))
+    for m in TOOL_DIFF_RE.finditer(text):
+        commands.append(("diff", m.group(1).strip()))
+    for m in TOOL_CREAR_RE.finditer(text):
+        commands.append(("crear", m.group(1).strip()))
+    for m in TOOL_GITHUB_RE.finditer(text):
+        commands.append(("github", m.group(1).strip()))
     for m in TOOL_GREP_RE.finditer(text):
         commands.append(("grep", m.group(1).strip()))
     for m in TOOL_GLOB_RE.finditer(text):
@@ -575,16 +613,58 @@ def execute_command(command: str, auto_install: bool = True) -> dict:
 
 def search_web(query: str) -> str:
     try:
+        domain_filter = None
+        if " dominio:" in query:
+            parts = query.split(" dominio:", 1)
+            query = parts[0].strip()
+            domain_filter = parts[1].strip().lower().rstrip("/")
+
+        depth = 0
+        if " profundidad:" in query:
+            parts = query.split(" profundidad:", 1)
+            query = parts[0].strip()
+            try:
+                depth = min(int(parts[1].strip().split()[0]), 2)
+            except (ValueError, IndexError):
+                depth = 0
+
         from duckduckgo_search import DDGS
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=5))
         if not results:
             return "(sin resultados)"
-        lines = [
-            f"• {r.get('title', '')}: {r.get('body', '')[:200]} [{r.get('href', '')}]"
-            for r in results
-        ]
-        return "\n".join(lines)
+
+        lines = []
+        for r in results:
+            title = r.get('title', '')
+            body = r.get('body', '')[:300]
+            href = r.get('href', '')
+            if domain_filter and domain_filter not in href.lower():
+                continue
+            lines.append(f"• {title}: {body} [{href}]")
+            if depth > 0 and href and (not domain_filter or domain_filter in href.lower()):
+                try:
+                    import httpx
+                    resp = httpx.get(href, timeout=10, follow_redirects=True)
+                    content = resp.text[:2000]
+                    import re as _re
+                    text = _re.sub(r'<[^>]+>', ' ', content)
+                    text = _re.sub(r'\s+', ' ', text).strip()[:1000]
+                    lines.append(f"  └ Crawl: {text[:500]}")
+                    if depth > 1:
+                        sub_links = re.findall(r'href=[\'"]?(https?://[^\'" >]+)', content)[:3]
+                        for sl in sub_links:
+                            try:
+                                sub_resp = httpx.get(sl, timeout=8, follow_redirects=True)
+                                sub_text = _re.sub(r'<[^>]+>', ' ', sub_resp.text)
+                                sub_text = _re.sub(r'\s+', ' ', sub_text).strip()[:500]
+                                lines.append(f"    └ {sl}: {sub_text[:200]}")
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+        return "\n".join(lines) if lines else "(sin resultados para el filtro)"
     except Exception as e:
         return f"[Error de búsqueda: {e}]"
 
@@ -641,6 +721,57 @@ def _handle_tareas(arg: str) -> dict:
         return {"total": len(TAREAS_DB[conv_key]["pasos"]), "completados": len(completados), "pendientes": len(pendientes), "siguiente": pendientes[0] if pendientes else None}
     return {"status": f"tarea: {arg}"}
 
+
+def _handle_github(arg: str) -> dict:
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
+        return {"error": "GITHUB_TOKEN no configurado. Ponlo en backend/.env"}
+    try:
+        from github import Github
+        g = Github(token)
+    except ImportError:
+        return {"error": "PyGithub no instalado (pip install PyGithub)"}
+    except Exception as e:
+        return {"error": f"Error conectando a GitHub: {e}"}
+
+    parts = arg.strip().split(" ", 2)
+    action = parts[0].lower() if parts else ""
+    sub = parts[1] if len(parts) > 1 else ""
+    data = parts[2] if len(parts) > 2 else ""
+
+    try:
+        if action == "repos":
+            repos = [r.full_name for r in g.get_user().get_repos()][:30]
+            return {"repos": repos}
+        elif action == "issues":
+            repo = g.get_repo(sub)
+            issues = [{"number": i.number, "title": i.title, "state": i.state} for i in repo.get_issues()[:20]]
+            return {"issues": issues}
+        elif action == "prs":
+            repo = g.get_repo(sub)
+            prs = [{"number": p.number, "title": p.title, "state": p.state} for p in repo.get_pulls(state="all")[:20]]
+            return {"prs": prs}
+        elif action == "create_issue":
+            repo = g.get_repo(sub)
+            issue = repo.create_issue(title=data)
+            return {"issue": issue.number, "title": issue.title, "url": issue.html_url}
+        elif action == "create_pr":
+            repo = g.get_repo(sub)
+            parts_data = data.split(" | ")
+            title = parts_data[0] if parts_data else "PR"
+            body = parts_data[1] if len(parts_data) > 1 else ""
+            head = parts_data[2] if len(parts_data) > 2 else "main"
+            base = parts_data[3] if len(parts_data) > 3 else "main"
+            pr = repo.create_pull(title=title, body=body, head=head, base=base)
+            return {"pr": pr.number, "title": pr.title, "url": pr.html_url}
+        elif action == "status":
+            user = g.get_user()
+            return {"user": user.login, "repos": user.public_repos, "followers": user.followers}
+        else:
+            return {"error": f"Comando no valido. Usa: repos, issues <repo>, prs <repo>, create_issue <repo> <title>, create_pr <repo> <title | body | head | base>, status"}
+    except Exception as e:
+        return {"error": f"GitHub error: {e}"}
+
 def _parse_edit_arg(arg: str) -> dict:
     import shlex
     try:
@@ -653,11 +784,20 @@ def _parse_edit_arg(arg: str) -> dict:
 
 TOOL_HANDLERS = {
     "read": lambda arg: _exec_httpx("tools/read", {"path": arg}),
+    "readpdf": lambda arg: _exec_httpx("tools/readpdf", {"path": arg}),
     "write": lambda arg: _exec_httpx("tools/write", {"path": arg.split(" ", 1)[0], "content": arg.split(" ", 1)[1] if " " in arg else ""}),
     "grep": lambda arg: _exec_httpx("tools/grep", {"pattern": arg.split(" ", 1)[0], "path": arg.split(" ", 1)[1] if " " in arg else "."}),
     "glob": lambda arg: _exec_httpx("tools/glob", {"pattern": arg}),
     "fetch": lambda arg: _exec_httpx("tools/fetch", {"url": arg}),
     "edit": lambda arg: _exec_httpx("tools/edit", {"arg": arg}),
+    "mover": lambda arg: _exec_httpx("tools/move", {"arg": arg}),
+    "copiar": lambda arg: _exec_httpx("tools/copy", {"arg": arg}),
+    "eliminar": lambda arg: _exec_httpx("tools/delete", {"path": arg}),
+    "ver": lambda arg: _exec_httpx("tools/readimg", {"path": arg}),
+    "revisar": lambda arg: _exec_httpx("tools/review", {"path": arg}),
+    "diff": lambda arg: _exec_httpx("tools/diff", {"path": arg}),
+    "crear": lambda arg: _exec_httpx("tools/scaffold", {"arg": arg}),
+    "github": lambda arg: _handle_github(arg),
     "explorar": lambda arg: _exec_httpx("tools/explore", {"path": arg}),
     "preguntar": lambda arg: {"tipo": "pregunta", "pregunta": arg, "esperando": True},
     "tareas": lambda arg: _handle_tareas(arg),
@@ -674,11 +814,17 @@ def _exec_httpx(endpoint: str, data: dict) -> dict:
         return {"error": str(e)}
 
 def process_tool_commands(response_text: str) -> tuple:
+    global TOOL_INTERRUPTED
     tool_results = []
     lines = response_text.split("\n")
     cleaned = []
 
     for line in lines:
+        if TOOL_INTERRUPTED:
+            tool_results.append({"command": "!interrumpido", "output": "Ejecución cancelada por el usuario"})
+            TOOL_INTERRUPTED = False
+            break
+
         m_cmd = TOOL_CMD_RE.match(line)
         if m_cmd:
             result = execute_command(m_cmd.group(1).strip())
@@ -697,6 +843,13 @@ def process_tool_commands(response_text: str) -> tuple:
             result = TOOL_HANDLERS["read"](m_read.group(1).strip())
             tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
             continue
+
+        m_readpdf = TOOL_READPDF_RE.match(line)
+        if m_readpdf:
+            result = TOOL_HANDLERS["readpdf"](m_readpdf.group(1).strip())
+            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
+            continue
+
         m_write = TOOL_WRITE_RE.match(line)
         if m_write:
             result = TOOL_HANDLERS["write"](m_write.group(1).strip())
@@ -741,6 +894,47 @@ def process_tool_commands(response_text: str) -> tuple:
         m_razonar = TOOL_RAZONAR_RE.match(line)
         if m_razonar:
             result = TOOL_HANDLERS["razonar"](m_razonar.group(1).strip())
+            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
+            continue
+
+        m_mover = TOOL_MOVER_RE.match(line)
+        if m_mover:
+            result = TOOL_HANDLERS["mover"](m_mover.group(1).strip())
+            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
+            continue
+        m_copiar = TOOL_COPIAR_RE.match(line)
+        if m_copiar:
+            result = TOOL_HANDLERS["copiar"](m_copiar.group(1).strip())
+            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
+            continue
+        m_eliminar = TOOL_ELIMINAR_RE.match(line)
+        if m_eliminar:
+            result = TOOL_HANDLERS["eliminar"](m_eliminar.group(1).strip())
+            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
+            continue
+        m_ver = TOOL_VER_RE.match(line)
+        if m_ver:
+            result = TOOL_HANDLERS["ver"](m_ver.group(1).strip())
+            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
+            continue
+        m_revisar = TOOL_REVISAR_RE.match(line)
+        if m_revisar:
+            result = TOOL_HANDLERS["revisar"](m_revisar.group(1).strip())
+            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
+            continue
+        m_diff = TOOL_DIFF_RE.match(line)
+        if m_diff:
+            result = TOOL_HANDLERS["diff"](m_diff.group(1).strip())
+            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
+            continue
+        m_crear = TOOL_CREAR_RE.match(line)
+        if m_crear:
+            result = TOOL_HANDLERS["crear"](m_crear.group(1).strip())
+            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
+            continue
+        m_github = TOOL_GITHUB_RE.match(line)
+        if m_github:
+            result = TOOL_HANDLERS["github"](m_github.group(1).strip())
             tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
             continue
 
@@ -1009,6 +1203,201 @@ async def speak(req: SpeakRequest, authorization: str = Header(None)):
         raise HTTPException(500, f"Error de TTS: {e}")
 
 # ─── Herramientas de sistema (leer, escribir, grep, glob, fetch) ───
+
+@app.post("/tools/move")
+async def tool_move(data: dict = Body({}), authorization: str = Header(None)):
+    verify_token(authorization)
+    arg = data.get("arg", "")
+    try:
+        parts = arg.rsplit(" ", 1)
+        if len(parts) < 2:
+            raise HTTPException(400, "Formato: !mover: origen destino")
+        src, dst = parts[0], parts[1]
+        Path(src).rename(dst)
+        return {"from": src, "to": dst, "status": "movido"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Error moviendo: {e}")
+
+
+@app.post("/tools/copy")
+async def tool_copy(data: dict = Body({}), authorization: str = Header(None)):
+    verify_token(authorization)
+    arg = data.get("arg", "")
+    try:
+        import shutil
+        parts = arg.rsplit(" ", 1)
+        if len(parts) < 2:
+            raise HTTPException(400, "Formato: !copiar: origen destino")
+        src, dst = parts[0], parts[1]
+        if Path(src).is_dir():
+            shutil.copytree(src, dst)
+        else:
+            shutil.copy2(src, dst)
+        return {"from": src, "to": dst, "status": "copiado"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Error copiando: {e}")
+
+
+@app.post("/tools/delete")
+async def tool_delete(data: dict = Body({}), authorization: str = Header(None)):
+    verify_token(authorization)
+    path = data.get("path", "")
+    try:
+        p = Path(path)
+        if not p.exists():
+            raise HTTPException(404, "Archivo no encontrado")
+        if p.is_dir():
+            import shutil
+            shutil.rmtree(p)
+        else:
+            p.unlink()
+        return {"path": path, "status": "eliminado"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Error eliminando: {e}")
+
+
+@app.post("/tools/readimg")
+async def tool_readimg(data: dict = Body({}), authorization: str = Header(None)):
+    verify_token(authorization)
+    path = data.get("path", "")
+    try:
+        if not Path(path).exists():
+            raise HTTPException(404, "Archivo no encontrado")
+        from PIL import Image
+        img = Image.open(path)
+        info = {"format": img.format, "size": f"{img.size[0]}x{img.size[1]}", "mode": img.mode}
+        try:
+            import pytesseract
+            text = pytesseract.image_to_string(img)
+            info["ocr_text"] = text[:5000]
+        except Exception:
+            info["ocr_text"] = "(Tesseract no disponible)"
+        return {"path": path, "info": info}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Error leyendo imagen: {e}")
+
+
+@app.post("/tools/review")
+async def tool_review(data: dict = Body({}), authorization: str = Header(None)):
+    verify_token(authorization)
+    path = data.get("path", "")
+    try:
+        p = Path(path)
+        if not p.exists():
+            raise HTTPException(404, "Archivo no encontrado")
+        content = p.read_text(encoding="utf-8", errors="replace")
+        prompt = f"Revisa este código y da feedback línea por línea. Señala bugs, problemas de seguridad, estilo, y sugiere mejoras:\n\n```\n{content[:15000]}\n```"
+        result = call_ollama(prompt, temperature=0.2)
+        return {"path": path, "review": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Error revisando: {e}")
+
+
+@app.post("/tools/diff")
+async def tool_diff(data: dict = Body({}), authorization: str = Header(None)):
+    verify_token(authorization)
+    path = data.get("path", "")
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["git", "diff"],
+            capture_output=True, text=True, timeout=30,
+            cwd=path or None
+        )
+        diff = (result.stdout or result.stderr or "")[:20000]
+        return {"path": path or ".", "diff": diff, "has_changes": len(diff) > 0}
+    except Exception as e:
+        return {"path": path or ".", "diff": f"Error: {e}", "has_changes": False}
+
+
+TEMPLATES = {
+    "python": {
+        "README.md": "# {name}\n\n## Descripción\n\nProyecto Python",
+        "main.py": "def main():\n    print(\"Hello from {name}\")\n\nif __name__ == \"__main__\":\n    main()\n",
+        "requirements.txt": "# {name}\n",
+    },
+    "fastapi": {
+        "README.md": "# {name}\n\nFastAPI project",
+        "main.py": "from fastapi import FastAPI\n\napp = FastAPI(title=\"{name}\")\n\n@app.get(\"/\")\ndef root():\n    return {\"message\": \"Hello from {name}\"}\n",
+        "requirements.txt": "fastapi\nuvicorn\n",
+    },
+    "react": {
+        "README.md": "# {name}\n\nReact project",
+        "package.json": '{{\n  "name": "{name}",\n  "version": "1.0.0",\n  "scripts": {{\n    "dev": "vite",\n    "build": "vite build"\n  }}\n}}',
+        "index.html": "<!DOCTYPE html>\n<html><head><title>{name}</title></head><body><div id=\"root\"></div></body></html>",
+    },
+    "cli": {
+        "README.md": "# {name}\n\nCLI tool",
+        "{name}.py": "import argparse\n\ndef main():\n    parser = argparse.ArgumentParser(description=\"{name}\")\n    args = parser.parse_args()\n    print(\"Hello from {name}\")\n\nif __name__ == \"__main__\":\n    main()\n",
+        "requirements.txt": "# {name}\n",
+    },
+}
+
+
+@app.post("/tools/scaffold")
+async def tool_scaffold(data: dict = Body({}), authorization: str = Header(None)):
+    verify_token(authorization)
+    arg = data.get("arg", "")
+    try:
+        parts = arg.strip().split(" ", 1)
+        template_name = parts[0].lower() if parts else "python"
+        project_name = parts[1] if len(parts) > 1 else "my_project"
+        template = TEMPLATES.get(template_name)
+        if not template:
+            return {"error": f"Template no encontrado. Usa: {', '.join(TEMPLATES.keys())}"}
+        base = Path(project_name)
+        base.mkdir(parents=True, exist_ok=True)
+        created = []
+        for filename, content in template.items():
+            fpath = base / filename.replace("{name}", project_name)
+            fpath.write_text(content.replace("{name}", project_name), encoding="utf-8")
+            created.append(str(fpath))
+        return {"template": template_name, "project": project_name, "files": created, "path": str(base.resolve())}
+    except Exception as e:
+        raise HTTPException(500, f"Error creando proyecto: {e}")
+
+
+@app.post("/tools/interrupt")
+def tool_interrupt(authorization: str = Header(None)):
+    verify_token(authorization)
+    global TOOL_INTERRUPTED
+    TOOL_INTERRUPTED = True
+    return {"ok": True}
+
+
+@app.post("/tools/readpdf")
+async def tool_readpdf(data: dict = Body({}), authorization: str = Header(None)):
+    verify_token(authorization)
+    path = data.get("path", "")
+    try:
+        if not Path(path).exists():
+            raise HTTPException(404, "Archivo no encontrado")
+        import fitz
+        doc = fitz.open(path)
+        pages = []
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            text = page.get_text()
+            pages.append({"page": page_num + 1, "text": text[:5000]})
+        doc.close()
+        return {"path": path, "pages": len(pages), "content": pages}
+    except HTTPException:
+        raise
+    except ImportError:
+        raise HTTPException(500, "PyMuPDF no instalado (pip install pymupdf)")
+    except Exception as e:
+        raise HTTPException(500, f"Error leyendo PDF: {e}")
+
 
 @app.post("/tools/read")
 async def tool_read(data: dict = Body({}), authorization: str = Header(None)):

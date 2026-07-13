@@ -8,7 +8,7 @@ log = logging.getLogger("artenisa.report")
 
 REPORTS_DIR = Path(__file__).parent / "data" / "reports"
 
-MIME_MAP = {"md": "text/markdown", "html": "text/html", "json": "application/json"}
+MIME_MAP = {"md": "text/markdown", "html": "text/html", "json": "application/json", "pdf": "application/pdf"}
 
 MAX_CONTENT_LENGTH = 50_000
 
@@ -21,32 +21,73 @@ def _ts() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-def generate_report(target: str, data: dict, fmt: str = "md") -> dict:
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    ext = fmt
-    filename = f"report_{_sanitize(target)}_{_ts()}.{ext}"
-    path = REPORTS_DIR / filename
+def generate_report(target: str, data: dict, fmt: str = "md", output_path: str | None = None) -> dict:
+    if output_path:
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        ext = fmt
+        filename = f"report_{_sanitize(target)}_{_ts()}.{ext}"
+        path = REPORTS_DIR / filename
 
     generators = {"md": generate_markdown, "html": generate_html, "json": generate_json}
     gen = generators.get(fmt)
+    if fmt == "pdf":
+        html_content = generate_html(target, data)
+        _html_to_pdf(html_content, str(path))
+        size = path.stat().st_size
+        return {
+            "format": fmt,
+            "filename": path.name,
+            "path": str(path),
+            "size": size,
+            "mime": MIME_MAP.get(fmt, "application/pdf"),
+            "content": f"PDF generado: {path} ({size} bytes)",
+        }
     if gen is None:
-        raise ValueError(f"Formato no soportado: {fmt}. Usa: md, html, json")
-    content = gen(target, data)
+        raise ValueError(f"Formato no soportado: {fmt}. Usa: md, html, json, pdf")
 
+    content = gen(target, data)
     path.write_text(content, encoding="utf-8")
     size = path.stat().st_size
-
     if len(content) > MAX_CONTENT_LENGTH:
         content = content[:MAX_CONTENT_LENGTH]
-
     return {
         "format": fmt,
-        "filename": filename,
+        "filename": path.name,
         "path": str(path),
         "size": size,
         "mime": MIME_MAP.get(fmt, "text/plain"),
         "content": content,
     }
+
+
+def _html_to_pdf(html: str, output_path: str) -> bytes:
+    from fpdf import FPDF
+
+    pdf = FPDF()
+    pdf.add_font("DejaVu", "", r"C:\Windows\Fonts\DejaVuSans.ttf", uni=True)
+    pdf.add_font("DejaVu", "B", r"C:\Windows\Fonts\DejaVuSans-Bold.ttf", uni=True)
+    pdf.set_auto_page_break(auto=True, margin=20)
+
+    for line in html.split("\n"):
+        text = re.sub(r'<[^>]+>', '', line).strip()
+        if not text:
+            continue
+        if '<h1>' in line:
+            pdf.add_page()
+            pdf.set_font("DejaVu", "B", 16)
+            pdf.cell(0, 10, text, new_x="LMARGIN", new_y="NEXT")
+        elif '<h2>' in line or '<strong>' in line:
+            pdf.set_font("DejaVu", "B", 11)
+            pdf.cell(0, 7, text, new_x="LMARGIN", new_y="NEXT")
+        else:
+            pdf.set_font("DejaVu", "", 10)
+            pdf.multi_cell(0, 5, text)
+
+    pdf.output(output_path)
+    return Path(output_path).read_bytes()
 
 
 def generate_markdown(target: str, data: dict) -> str:
@@ -169,3 +210,9 @@ def generate_json(target: str, data: dict) -> str:
         }
     }
     return json.dumps(report, indent=2, ensure_ascii=False)
+
+
+def generate_pdf(target: str, data: dict) -> str:
+    html = generate_html(target, data)
+    return _html_to_pdf(html, "")  # dummy call, real PDF uses path
+
