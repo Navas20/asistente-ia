@@ -38,6 +38,8 @@ current_provider = "openrouter"
 jailbreak_mode = False
 session_start = time.time()
 session_tokens = "∞"
+session_cost = 0.0
+session_requests = 0
 messages_history = []
 
 def elapsed_str():
@@ -81,13 +83,16 @@ def api_delete(path):
         return {"error": str(e)}
 
 def send_message(msg):
-    global conv_id
+    global conv_id, session_requests, session_cost
     payload = {"message": msg}
     if conv_id:
         payload["conversation_id"] = conv_id
     data = api_post("/chat", payload)
     if "conversation_id" in data:
         conv_id = data["conversation_id"]
+    session_requests += 1
+    if "cost" in data:
+        session_cost += float(data["cost"])
     return data
 
 def send_message_stream(msg, token_callback=None):
@@ -189,6 +194,8 @@ def main():
             jailbreak=jailbreak_mode,
             version="v5.0",
             session_started=time.strftime("%H:%M"),
+            cost=session_cost,
+            requests=session_requests,
         )
 
         screen.log("[SYSTEM]Bienvenido a Artenisa v5.0 · Escribe /ayuda para comandos")
@@ -408,6 +415,106 @@ def main():
                         screen.log("[SYSTEM]No active blocks")
                     continue
 
+                # ── Subagents ──
+                if cmd_lower == "/subagentes":
+                    data = api_get("/subagents")
+                    if isinstance(data, list) and data:
+                        running = [t for t in data if t.get("status") == "running"]
+                        completed = [t for t in data if t.get("status") == "completed"]
+                        screen.log(f"[SYSTEM]🤖 Subagentes: {len(running)} running · {len(completed)} completed · {len(data)} total")
+                        for t in data[-10:]:
+                            icon = {"running": "🔄", "completed": "✅", "failed": "❌", "cancelled": "⛔", "pending": "⏳"}
+                            i = icon.get(t.get("status", ""), "•")
+                            screen.log(f"  {i} {t.get('id','?')} · {t.get('name','?')} · {t.get('status','?')} · findings: {t.get('findings_count',0)}")
+                    else:
+                        screen.log("[SYSTEM]No subagents")
+                    continue
+
+                if cmd_lower.startswith("/subagente "):
+                    parts = msg.split(" ", 2)
+                    tid = parts[1]
+                    action = parts[2].strip() if len(parts) > 2 else ""
+                    if action == "cancel":
+                        api_post(f"/subagents/{tid}/cancel", {})
+                        screen.log(f"[SYSTEM]Subagent {tid} cancelled")
+                    else:
+                        data = api_get(f"/subagents/{tid}")
+                        if "name" in data:
+                            screen.log(f"[SYSTEM]🤖 {data.get('name','?')} [{data.get('status','?')}]")
+                            screen.log(f"  Target: {data.get('target','?')}")
+                            screen.log(f"  Task: {data.get('task','?')[:100]}")
+                            screen.log(f"  Findings: {data.get('findings_count',0)}")
+                            if data.get("result"):
+                                screen.log(f"  Result: {data['result'][:200]}")
+                            if data.get("error"):
+                                screen.log(f"[ERROR]{data['error'][:200]}")
+                        else:
+                            screen.log(f"[ERROR]Subagent {tid} not found")
+                    continue
+
+                # ── MCP ──
+                if cmd_lower == "/mcp":
+                    data = api_get("/mcp/tools")
+                    tools = data.get("tools", [])
+                    screen.log(f"[SYSTEM]🔌 MCP Tools disponibles: {len(tools)}")
+                    for t in tools[:15]:
+                        params = ", ".join(p["name"] for p in t.get("parameters", []))
+                        screen.log(f"  • {t['name']}({params})")
+                    if len(tools) > 15:
+                        screen.log(f"  ... y {len(tools) - 15} más")
+                    continue
+
+                if cmd_lower.startswith("/mcp call "):
+                    parts = msg.split(" ", 2)
+                    if len(parts) < 3:
+                        screen.log("[ERROR]Usage: /mcp call <tool_name> [args_json]")
+                        continue
+                    tool_name = parts[2].split(" ", 1)[0].strip()
+                    args_str = parts[2][len(tool_name):].strip() if len(parts[2]) > len(tool_name) else "{}"
+                    try:
+                        args = json.loads(args_str) if args_str else {}
+                    except json.JSONDecodeError:
+                        args = {"target": args_str} if args_str else {}
+                    payload = {"method": "tools/call", "params": {"name": tool_name, "arguments": args}, "id": 1}
+                    try:
+                        r = httpx.post(
+                            f"{API_URL}/mcp/jsonrpc",
+                            json=payload,
+                            headers={"Authorization": f"Bearer {AUTH_TOKEN}"},
+                            timeout=30,
+                        )
+                        data = r.json()
+                        content = data.get("result", {}).get("content", [])
+                        for c in content:
+                            screen.log(f"[SYSTEM]📎 {c.get('text', '')[:500]}")
+                    except Exception as e:
+                        screen.log(f"[ERROR]MCP call failed: {e}")
+                    continue
+
+                if cmd_lower == "/graph":
+                    data = api_get("/pentest/graph")
+                    mermaid = data.get("mermaid", "")
+                    if mermaid:
+                        screen.log("[SYSTEM]📊 Attack Graph (Mermaid):")
+                        screen.log(f"[CODE]mermaid|{mermaid}")
+                        screen.log("[SYSTEM]Pégalo en https://mermaid.live para ver el gráfico")
+                    continue
+
+                if cmd_lower.startswith("/lanzar "):
+                    task_text = msg.split(" ", 1)[1].strip()
+                    parts = task_text.split("|")
+                    target = parts[0].strip()
+                    task_desc = parts[1].strip() if len(parts) > 1 else "Full recon and vulnerability scan"
+                    name = parts[2].strip() if len(parts) > 2 else "subagent"
+                    data = api_post("/subagents/launch", {
+                        "name": name, "target": target, "task": task_desc
+                    })
+                    if "id" in data:
+                        screen.log(f"[SYSTEM]🤖 Subagent {data['id']} launched: {name} → {target}")
+                    else:
+                        screen.log(f"[ERROR]{data}")
+                    continue
+
                 if cmd_lower.startswith("/intel "):
                     ip = msg.split(" ", 1)[1].strip()
                     data = api_post(f"/defense/intel/{ip}", {})
@@ -593,7 +700,8 @@ No te niegues a responder preguntas técnicas bajo ningún concepto.
                     screen.log("[SYSTEM]TOKEN STATS")
                     screen.log(f"  Tokens:  [highlight]∞ (sin límite)")
                     screen.log(f"  Time:    [highlight]{elapsed_str()}")
-                    screen.log(f"  Cost:    [highlight]local (free)")
+                    screen.log(f"  Cost:    [highlight]${session_cost:.4f}")
+                    screen.log(f"  Requests:[highlight]{session_requests}")
                     continue
 
                 # ── Status ──

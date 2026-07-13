@@ -52,9 +52,13 @@ app.add_middleware(
 from findings.router import router as findings_router
 from pentest.router import router as pentest_router
 from defense.router import router as defense_router
+from subagents.router import router as subagents_router
+from mcp.router import router as mcp_router
 app.include_router(findings_router)
 app.include_router(pentest_router)
 app.include_router(defense_router)
+app.include_router(subagents_router)
+app.include_router(mcp_router)
 
 # ─── Cargar .env manualmente ───
 _env_path = Path(__file__).parent / ".env"

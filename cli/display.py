@@ -180,7 +180,8 @@ class Screen:
             side_lines.append(f"[bold #b380ff]Contexto[/]")
             side_lines.append(f"{t.get('tokens', 0):,} tokens")
             side_lines.append(f"{t.get('context_pct', 0)}% usado")
-            side_lines.append(f"[dim]${t.get('cost', 0.0):.2f} gastado[/]")
+            side_lines.append(f"[dim]${t.get('cost', 0.0):.4f} cost[/]")
+            side_lines.append(f"[dim]{t.get('requests', 0)} req[/]")
             side_lines.append("")
             side_lines.append(f"[bold #b380ff]Provider[/]")
             side_lines.append(f"{t.get('provider', '?')}")
@@ -298,6 +299,7 @@ class Screen:
             ("/pentest status", "Pipeline progress"),
             ("/pentest cancel", "Cancel pipeline"),
             ("/phase", "Show current phase"),
+            ("/graph", "Show attack graph (Mermaid)"),
             ("/scope", "Show scope rules"),
             ("/scope add <rule>", "Add scope (CIDR/domain)"),
             ("/scope remove <rule>", "Remove scope rule"),
@@ -321,6 +323,17 @@ class Screen:
             ("/incident <id> report", "Generate legal report"),
             ("/blocks", "List active blocks"),
             ("/intel <ip>", "Threat intel lookup"),
+            ("", ""),
+            ("", ""),
+            ("[bold cyan]MCP[/]", ""),
+            ("/mcp", "List MCP tools"),
+            ("/mcp call <t> [args]", "Call MCP tool"),
+            ("", ""),
+            ("[bold #ff9900]SUBAGENTS[/]", ""),
+            ("/lanzar <t>\|task\|name", "Launch subagent"),
+            ("/subagentes", "List subagents"),
+            ("/subagente <id>", "Subagent detail"),
+            ("/subagente <id> cancel", "Cancel subagent"),
             ("", ""),
             ("[bold #b380ff]GENERAL[/]", ""),
             ("/salir", "Exit"),

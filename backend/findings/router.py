@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from .engine import FindingsManager
 from .models import Finding
+from .review import auto_review
 
 router = APIRouter(prefix="/findings", tags=["findings"])
 fm = FindingsManager()
@@ -73,3 +74,10 @@ def export_findings(format: str = Query("json")):
 def clear_findings(host: str | None = Query(None), phase: str | None = Query(None)):
     fm.clear(host=host, phase=phase)
     return {"ok": True}
+
+
+@router.post("/review")
+def review_findings():
+    result = auto_review()
+    return result
+
