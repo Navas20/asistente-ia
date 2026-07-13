@@ -1,20 +1,22 @@
 version: "3.9"
 
 services:
-  jarvis:
+  artenisa-backend:
     build:
       context: .
       dockerfile: Dockerfile
+    container_name: artenisa-backend
     ports:
       - "8000:8000"
     environment:
       - AUTH_TOKEN=${AUTH_TOKEN:-cambia-este-token-urgentemente}
-      - OPENROUTER_MODEL=${OPENROUTER_MODEL:-nex-agi/nex-n2-pro:free}
+      - OPENROUTER_MODEL=${OPENROUTER_MODEL:-deepseek/deepseek-chat:free}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - DB_PATH=/data/conversations.db
       - UPLOAD_DIR=/data/uploads
+      - ALLOWED_USER_IDS=${ALLOWED_USER_IDS}
     volumes:
-      - jarvis_data:/data
+      - artenisa_data:/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -22,20 +24,22 @@ services:
       timeout: 5s
       retries: 3
 
-  telegram-bot:
+  artenisa-telegram-bot:
     build:
       context: .
       dockerfile: Dockerfile
-    command: python3 /app/telegram_bot.py
+    container_name: artenisa-telegram-bot
+    entrypoint: []
+    command: python3 telegram_bot.py
     environment:
-      - API_URL=http://jarvis:8000
+      - API_URL=http://artenisa-backend:8000
       - AUTH_TOKEN=${AUTH_TOKEN:-cambia-este-token-urgentemente}
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
-      - ALLOWED_USER_ID=${ALLOWED_USER_ID}
+      - ALLOWED_USER_IDS=${ALLOWED_USER_IDS}
     depends_on:
-      jarvis:
+      artenisa-backend:
         condition: service_healthy
     restart: unless-stopped
 
 volumes:
-  jarvis_data:
+  artenisa_data:
