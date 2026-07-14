@@ -1,4 +1,5 @@
 import os
+import asyncio
 import logging
 import subprocess
 from datetime import datetime
@@ -29,13 +30,11 @@ audit_log = AuditLog()
 rate_limiter = RateLimiter()
 user_wizards = {}
 user_depths = {}
-voice_mode_users = set()
-
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("\U0001f50d Recon"), KeyboardButton("\U0001f310 Web"), KeyboardButton("\U0001f511 Crack")],
         [KeyboardButton("\U0001f4a3 Payloads"), KeyboardButton("\U0001f4e1 Red"), KeyboardButton("\U0001f50e OSINT")],
-        [KeyboardButton("\U0001f4da Playbooks"), KeyboardButton("\U0001f4c4 Reporte"), KeyboardButton("\u2699\ufe0f Sistema")],
+        [KeyboardButton("\U0001f4cb Mis Tareas"), KeyboardButton("\u2753 Ayuda"), KeyboardButton("\u2699\ufe0f Objetivo")],
     ],
     resize_keyboard=True,
 )
@@ -119,19 +118,6 @@ async def olvidar_objetivo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\U0001f5d1\ufe0f Objetivo olvidado.")
 
 
-async def voz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not _check_role(uid):
-        await update.message.reply_text("\u274c No autorizado")
-        return
-    if uid in voice_mode_users:
-        voice_mode_users.discard(uid)
-        await update.message.reply_text("\U0001f507 Modo voz desactivado.")
-    else:
-        voice_mode_users.add(uid)
-        await update.message.reply_text("\U0001f50a Modo voz activado. Las respuestas se enviar\u00e1n como audio.")
-
-
 async def tarea(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not _check_role(uid):
@@ -192,44 +178,6 @@ async def tareas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not _check_role(uid):
-        await update.message.reply_text("\u274c No autorizado")
-        return
-    rl = _rate_limit_msg(uid)
-    if rl:
-        await update.message.reply_text(rl)
-        return
-    if not context.args:
-        await update.message.reply_text("Uso: /analizar <file_id>\nEnv\u00eda una foto primero para obtener su file_id.")
-        return
-    file_id = context.args[0]
-    try:
-        file = await context.bot.get_file(file_id)
-        file_bytes = await file.download_as_bytearray()
-        api = os.getenv("API_URL", "http://localhost:8000")
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{api}/upload",
-                files={"file": ("image.jpg", file_bytes, "image/jpeg")},
-                headers={"Authorization": f"Bearer {AUTH_TOKEN}"},
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                fid = data.get("file_id", "")
-                await update.message.reply_text(
-                    f"\U0001f4f8 Imagen subida.\n"
-                    f"ID: `{fid}`\n"
-                    f"El an\u00e1lisis por IA a\u00fan no est\u00e1 disponible.",
-                    parse_mode="Markdown"
-                )
-            else:
-                await update.message.reply_text(f"\u274c Error al subir: {resp.status_code}")
-    except Exception as e:
-        await update.message.reply_text(f"\u274c Error: {str(e)}")
-
-
 async def recon_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not _check_role(uid):
@@ -241,6 +189,148 @@ async def recon_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_wizards[uid] = {"type": "recon", "target": target, "step": "awaiting_depth"}
     await update.message.reply_text("Selecciona profundidad:", reply_markup=_depth_keyboard())
+
+
+async def nmap_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    log.info("[nmap] Handler called by %s, args=%s", uid, context.args)
+    try:
+        if not _check_role(uid):
+            await update.message.reply_text("\u274c No autorizado")
+            return
+        rl = _rate_limit_msg(uid)
+        if rl:
+            await update.message.reply_text(rl)
+            return
+
+        valid_types = {"quick", "normal", "full", "vuln"}
+        target = None
+        scan_type = "normal"
+
+        args = context.args or []
+        if len(args) == 0:
+            target_info = target_engine.get_target(uid)
+            if not target_info:
+                await update.message.reply_text("\u274c No hay objetivo. Usa /objetivo <target> primero.")
+                return
+            target = target_info["target"]
+
+        elif len(args) == 1:
+            if args[0] in valid_types:
+                scan_type = args[0]
+                target_info = target_engine.get_target(uid)
+                if not target_info:
+                    await update.message.reply_text("\u274c No hay objetivo. Usa /objetivo <target> primero o /nmap <scan_type> <target>")
+                    return
+                target = target_info["target"]
+            else:
+                target = args[0]
+
+        else:
+            scan_type = args[0]
+            if scan_type not in valid_types:
+                await update.message.reply_text(f"scan_type debe ser uno de: {', '.join(sorted(valid_types))}")
+                return
+            target = args[1]
+
+        from tools_engine import validate_target
+        error = validate_target(target)
+        if error:
+            await update.message.reply_text(f"\u274c {error}")
+            return
+
+        log.info("[nmap] Submitting: %s (%s)", target, scan_type)
+        task_id = task_queue.submit("nmap", target, {"scan_type": scan_type, "user_id": uid})
+        log.info("[nmap] Task ID: %s", task_id)
+
+        if not task_id:
+            await update.message.reply_text("\u274c Error al encolar tarea")
+            return
+
+        audit_log.log(uid, _username(update), "/nmap", target, "ok", f"task:{task_id}")
+
+        msg = await update.message.reply_text(
+            f"\u2705 `{task_id}` \u2014 Escaneando {target} ({scan_type})",
+            parse_mode="Markdown"
+        )
+
+        asyncio.create_task(_poll_nmap_task(msg, task_id))
+
+    except Exception as e:
+        log.error("[nmap] Exception: %s", e, exc_info=True)
+        try:
+            await update.message.reply_text(f"\u274c Error: {str(e)}")
+        except Exception:
+            pass
+
+
+async def _poll_nmap_task(msg, task_id, timeout=300):
+    await asyncio.sleep(2)
+    deadline = asyncio.get_event_loop().time() + timeout
+    while True:
+        status = task_queue.get_status(task_id)
+        if "error" in status:
+            return
+
+        s = status["status"]
+
+        if s == "completed":
+            result = status.get("result") or {}
+            target = status.get("target", "")
+            scan_type = (status.get("params") or {}).get("scan_type", "normal")
+            elapsed = result.get("elapsed", 0)
+            parsed = result.get("parsed")
+            stdout = result.get("stdout", "")
+
+            lines = [f"\u2705 *Nmap* `{target}` ({scan_type}) \u2014 {elapsed:.1f}s"]
+            if parsed:
+                hosts = parsed.get("summary", {}).get("hosts_up", 0)
+                ports = parsed.get("summary", {}).get("total_ports_found", 0)
+                if hosts:
+                    lines.append(f"Hosts: {hosts} | Puertos: {ports}")
+                for host in parsed.get("hosts", [])[:3]:
+                    ip = host.get("ip", "")
+                    hn = host.get("hostname", "")
+                    name = f" ({hn})" if hn else ""
+                    lines.append(f"\n`{ip}`{name}")
+                    for p in host.get("ports", [])[:10]:
+                        svc = f" - {p['service']}" if p.get("service") else ""
+                        lines.append(f"  \U0001f4e1 {p['port']}/{p['protocol']} {p['state']}{svc}")
+            else:
+                out = stdout[:1500] if stdout else "(sin salida)"
+                lines.append(f"\n```\n{out}\n```")
+            try:
+                await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+            except Exception:
+                pass
+            return
+
+        elif s == "failed":
+            error = status.get("error", "Error desconocido")
+            try:
+                await msg.edit_text(f"\u274c Nmap fall\u00f3: {error}")
+            except Exception:
+                pass
+            return
+
+        elif s == "running":
+            pct = status.get("progress", 0)
+            try:
+                await msg.edit_text(
+                    f"\u23f3 `{task_id}` \u2014 {pct}%",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+
+        if asyncio.get_event_loop().time() > deadline:
+            try:
+                await msg.edit_text(f"\u23f0 `{task_id}` \u2014 Tiempo agotado ({timeout}s)")
+            except Exception:
+                pass
+            return
+
+        await asyncio.sleep(2)
 
 
 async def webscan_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -317,6 +407,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid in user_wizards:
         wizard = user_wizards[uid]
         if wizard["step"] == "awaiting_target":
+            if wizard["type"] == "objetivo":
+                target_engine.set_target(uid, text, "domain")
+                user_wizards.pop(uid, None)
+                await update.message.reply_text(f"\u2705 Objetivo establecido: `{text}`", parse_mode="Markdown")
+                return
             wizard["target"] = text
             wizard["step"] = "awaiting_depth"
             await update.message.reply_text("Selecciona profundidad:", reply_markup=_depth_keyboard())
@@ -332,9 +427,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "\U0001f4a3 Payloads": lambda: _start_wizard(update, uid, "payload", None, "Introduce IP:puerto (ej: 10.0.0.1:4444):"),
         "\U0001f4e1 Red": lambda: _start_wizard(update, uid, "red", None, "Introduce IP o rango de red:"),
         "\U0001f50e OSINT": lambda: _start_wizard(update, uid, "osint", None, "Introduce dominio o email para OSINT:"),
-        "\U0001f4da Playbooks": lambda: _show_playbooks(update),
-        "\U0001f4c4 Reporte": lambda: _send_report(update, uid),
-        "\u2699\ufe0f Sistema": lambda: _system_status(update, uid),
+        "\U0001f4cb Mis Tareas": lambda: tareas(update, context),
+        "\u2753 Ayuda": lambda: ayuda(update, context),
+        "\u2699\ufe0f Objetivo": lambda: _objetivo_wizard(update, uid),
     }
 
     handler = menu.get(text)
@@ -350,6 +445,11 @@ async def _start_wizard(update, uid, wtype, keyboard, prompt):
     else:
         user_wizards[uid] = {"type": wtype, "step": "awaiting_target", "target": None}
     await update.message.reply_text(prompt, reply_markup=keyboard)
+
+
+async def _objetivo_wizard(update, uid):
+    user_wizards[uid] = {"type": "objetivo", "step": "awaiting_target", "target": None}
+    await update.message.reply_text("Introduce el target (IP, dominio o rango):")
 
 
 async def _execute_immediate(update, wizard, value):
@@ -569,7 +669,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     f"\U0001f4f8 Foto recibida.\n"
                     f"ID: `{file_id}`\n"
-                    f"Usa /analizar `{file_id}` para analizarla con OCR."
+                    f"ID: `{file_id}`"
                 )
             else:
                 await update.message.reply_text(f"\u274c Error al subir: {resp.status_code}")
@@ -635,6 +735,31 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text)
 
 
+# ─── Ayuda ───
+
+
+async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not _check_role(uid):
+        await update.message.reply_text("\u274c No autorizado")
+        return
+    msg = (
+        "*Comandos:*\n"
+        "`/objetivo <target>` \u2014 Establecer target global\n"
+        "`/nmap [tipo] [target]` \u2014 Escanear con Nmap\n"
+        "`/tarea <id>` \u2014 Ver estado de tarea\n"
+        "`/tareas` \u2014 Listar tareas\n"
+        "`/ayuda` \u2014 Esta ayuda\n\n"
+        "*Tipos de escaneo:* `quick`, `normal` (default), `full`, `vuln`\n\n"
+        "*Ejemplos:*\n"
+        "`/objetivo scanme.nmap.org`\n"
+        "`/nmap` \u2014 escanea objetivo guardado\n"
+        "`/nmap full` \u2014 escanea objetivo con full\n"
+        "`/nmap quick 8.8.8.8` \u2014 escanea otra IP"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
 # ─── Main ───
 
 
@@ -654,10 +779,16 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("objetivo", objetivo))
     application.add_handler(CommandHandler("olvidar_objetivo", olvidar_objetivo))
-    application.add_handler(CommandHandler("voz", voz))
     application.add_handler(CommandHandler("tarea", tarea))
     application.add_handler(CommandHandler("tareas", tareas))
-    application.add_handler(CommandHandler("analizar", analizar))
+    application.add_handler(CommandHandler("nmap", nmap_shortcut))
+    application.add_handler(CommandHandler("recon", nmap_shortcut))
+    application.add_handler(CommandHandler("webscan", webscan_shortcut))
+    application.add_handler(CommandHandler("crack", crack_shortcut))
+    application.add_handler(CommandHandler("payload", payload_shortcut))
+    application.add_handler(CommandHandler("osint", osint_shortcut))
+    application.add_handler(CommandHandler("ayuda", ayuda))
+    application.add_handler(CommandHandler("help", ayuda))
 
     # Manejador global de texto e interacción de menús
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

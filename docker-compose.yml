@@ -17,6 +17,7 @@ services:
       - DB_PATH=/data/conversations.db
       - UPLOAD_DIR=/data/uploads
       - ALLOWED_USER_IDS=${ALLOWED_USER_IDS}
+      - KALI_TOOLS_URL=http://artenisa-kali-tools:9001
     volumes:
       - artenisa_data:/data
     restart: unless-stopped
@@ -47,5 +48,28 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  artenisa-kali-tools:
+    build:
+      context: .
+      dockerfile: docker/kali.Dockerfile
+    container_name: artenisa-kali-tools
+    expose:
+      - "9001"
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - kali-tools-data:/tmp
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
 volumes:
   artenisa_data:
+  kali-tools-data:

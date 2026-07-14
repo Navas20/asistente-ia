@@ -8,10 +8,13 @@ RUN apt update && apt install -y \
 
 WORKDIR /app
 
-# Copiar el backend e instalar los requerimientos de Python
-COPY backend/ /app/
+# Copiar solo requirements primero para cachear pip/playwright
+COPY backend/requirements.txt /app/requirements.txt
 RUN pip3 install --no-cache-dir -r requirements.txt
 RUN pip3 install --no-cache-dir playwright && playwright install --with-deps chromium
+
+# Copiar el resto del backend
+COPY backend/ /app/
 
 # Crear directorios para datos, subidas y audios
 RUN mkdir -p data/uploads data/audio

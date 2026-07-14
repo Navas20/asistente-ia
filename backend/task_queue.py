@@ -143,6 +143,23 @@ class TaskQueue:
 
     def _run_task(self, task_id, task):
         try:
+            task_type = task["type"]
+            params = task.get("params", {})
+            target = task["target"]
+
+            if task_type == "nmap":
+                self._run_nmap_task(task_id, target, params)
+            else:
+                self._run_playbook_task(task_id, target, params)
+        except Exception as e:
+            logger.exception("Error ejecutando tarea %s", task_id)
+            self.fail(task_id, str(e))
+        finally:
+            with self._lock:
+                self._active -= 1
+
+    def _run_playbook_task(self, task_id, target, params):
+        try:
             try:
                 from playbooks import run_playbook
                 import hacking
@@ -153,8 +170,6 @@ class TaskQueue:
             def progress_callback(step, pct):
                 self.update_progress(task_id, pct, step)
 
-            params = task.get("params", {})
-            target = task["target"]
             pb_name = params.get("playbook", "")
             depth = params.get("depth", "rapido")
 
@@ -168,11 +183,36 @@ class TaskQueue:
 
             self.complete(task_id, result)
         except Exception as e:
-            logger.exception("Error ejecutando tarea %s", task_id)
+            logger.exception("Error en playbook task %s", task_id)
             self.fail(task_id, str(e))
-        finally:
-            with self._lock:
-                self._active -= 1
+
+    def _run_nmap_task(self, task_id, target, params):
+        try:
+            from tools_engine import tools_engine, validate_target
+
+            error = validate_target(target)
+            if error:
+                self.fail(task_id, error)
+                return
+
+            scan_type = params.get("scan_type", "normal")
+            user_id = params.get("user_id", 0)
+
+            self.update_progress(task_id, 15, "Ejecutando nmap...")
+
+            result = tools_engine.run_nmap(
+                target=target, scan_type=scan_type, user_id=user_id,
+            )
+            self.update_progress(task_id, 90, "Procesando resultados...")
+
+            if result.error:
+                self.fail(task_id, result.error)
+                return
+
+            self.complete(task_id, result.to_dict())
+        except Exception as e:
+            logger.exception("Error en nmap task %s", task_id)
+            self.fail(task_id, str(e))
 
     # ------------------------------------------------------------------ #
     # Persistence

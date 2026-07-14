@@ -56,6 +56,7 @@ from subagents.router import router as subagents_router
 from mcp.router import router as mcp_router
 from projects_router import router as projects_router
 from oast_router import router as oast_router
+from tools.router import router as tools_router
 app.include_router(findings_router)
 app.include_router(pentest_router)
 app.include_router(defense_router)
@@ -63,6 +64,7 @@ app.include_router(subagents_router)
 app.include_router(mcp_router)
 app.include_router(projects_router)
 app.include_router(oast_router)
+app.include_router(tools_router)
 
 # ─── Cargar .env manualmente ───
 _env_path = Path(__file__).parent / ".env"
