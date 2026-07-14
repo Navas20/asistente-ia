@@ -95,7 +95,7 @@ class TaskQueue:
     def complete(self, task_id, result):
         with self._lock:
             task = self._tasks.get(task_id)
-            if task is None:
+            if task is None or task.get("status") == "cancelled":
                 return
             task["status"] = "completed"
             task["progress"] = 100
@@ -107,7 +107,7 @@ class TaskQueue:
     def fail(self, task_id, error):
         with self._lock:
             task = self._tasks.get(task_id)
-            if task is None:
+            if task is None or task.get("status") == "cancelled":
                 return
             task["status"] = "failed"
             task["error"] = error
@@ -147,7 +147,9 @@ class TaskQueue:
             params = task.get("params", {})
             target = task["target"]
 
-            if task_type == "nmap":
+            if task_type == "tool":
+                self._run_tool_task(task_id, target, params)
+            elif task_type == "nmap":
                 self._run_nmap_task(task_id, target, params)
             else:
                 self._run_playbook_task(task_id, target, params)
@@ -205,13 +207,37 @@ class TaskQueue:
             )
             self.update_progress(task_id, 90, "Procesando resultados...")
 
-            if result.error:
-                self.fail(task_id, result.error)
+            if not result.success:
+                self.fail(task_id, result.error or result.stderr or f"nmap terminó con código {result.exit_code}")
                 return
 
             self.complete(task_id, result.to_dict())
         except Exception as e:
             logger.exception("Error en nmap task %s", task_id)
+            self.fail(task_id, str(e))
+
+    def _run_tool_task(self, task_id, target, params):
+        try:
+            from tools_engine import tools_engine
+
+            tool = params.get("tool", "")
+            self.update_progress(task_id, 15, f"Ejecutando {tool}...")
+            result = tools_engine.run_tool(
+                tool=tool,
+                target=target,
+                profile=params.get("profile", "default"),
+                options=params.get("options") or {},
+                timeout=params.get("timeout"),
+                user_id=params.get("user_id", 0),
+            )
+            self.update_progress(task_id, 90, "Procesando resultados...")
+            if not result.success:
+                error = result.error or result.stderr or f"{tool} terminó con código {result.exit_code}"
+                self.fail(task_id, error)
+                return
+            self.complete(task_id, result.to_dict())
+        except Exception as e:
+            logger.exception("Error en tool task %s", task_id)
             self.fail(task_id, str(e))
 
     # ------------------------------------------------------------------ #

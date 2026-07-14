@@ -7,7 +7,7 @@ import signal
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("kali_server")
@@ -19,9 +19,16 @@ MAX_STDOUT = 1_000_000
 
 class RunRequest(BaseModel):
     tool: str
-    args: list[str] = []
-    timeout: int = 300
+    args: list[str] = Field(default_factory=list, max_length=64)
+    timeout: int = Field(default=300, ge=1, le=600)
     task_id: str = ""
+
+    @field_validator("args")
+    @classmethod
+    def validate_args(cls, args: list[str]) -> list[str]:
+        if any(len(arg) > 2048 for arg in args) or sum(map(len, args)) > 8192:
+            raise ValueError("Argumentos demasiado largos")
+        return args
 
 
 class RunResponse(BaseModel):
@@ -95,6 +102,9 @@ def run_tool(req: RunRequest):
 
         if len(stdout) > MAX_STDOUT:
             stdout = stdout[:MAX_STDOUT]
+            truncated = True
+        if len(stderr) > MAX_STDOUT:
+            stderr = stderr[:MAX_STDOUT]
             truncated = True
 
         parsed = None
