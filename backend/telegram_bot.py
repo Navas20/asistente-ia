@@ -145,6 +145,7 @@ async def tarea(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "error" in status:
         await update.message.reply_text(f"\u274c {status['error']}")
         return
+
     msg = (
         f"\U0001f4cb *Tarea:* `{status['id']}`\n"
         f"\U0001f4cc Estado: `{status['status']}`\n"
@@ -152,6 +153,25 @@ async def tarea(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"\U0001f4c8 Progreso: {status['progress']}%\n"
         f"\U0001f527 Paso: {status['current_step'] or 'N/A'}"
     )
+
+    result = status.get("result")
+    if result and status["status"] == "completed":
+        summary = result.get("summary", "")
+        if summary:
+            msg += f"\n\n{summary}"
+        for step in result.get("results", []):
+            if step.get("step_id") == "screenshot":
+                data = step.get("data") or {}
+                if data.get("success"):
+                    import base64
+                    img_bytes = base64.b64decode(data["screenshot_base64"])
+                    await update.message.reply_photo(
+                        photo=img_bytes,
+                        caption=f"\U0001f4f7 Screenshot: {data.get('title', status['target'])}",
+                    )
+                elif data.get("error"):
+                    msg += f"\n\u26a0\ufe0f Screenshot: {data['error']}"
+
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
@@ -320,7 +340,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     handler = menu.get(text)
     if handler:
         await handler()
-    elif uid in voice_mode_users:
+    else:
         await _chat_api(update, text)
 
 
@@ -437,7 +457,10 @@ async def _chat_api(update, text):
             if resp.status_code == 200:
                 data = resp.json()
                 msg = data.get("response", "Sin respuesta")
-                await update.message.reply_text(msg, parse_mode="Markdown")
+                try:
+                    await update.message.reply_text(msg, parse_mode="Markdown")
+                except Exception:
+                    await update.message.reply_text(msg)
             else:
                 await update.message.reply_text(f"\u274c Error de API: {resp.status_code}")
     except Exception as e:
@@ -616,33 +639,36 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    if not TELEGRAM_TOKEN:
-        log.error("TELEGRAM_TOKEN no configurado")
+    """Función principal corregida para arrancar el bot de forma nativa sin congelar Docker"""
+    import os
+    token = os.getenv("TELEGRAM_TOKEN")
+    
+    if not token:
+        log.error("No se encontró la variable TELEGRAM_TOKEN")
         return
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("objetivo", objetivo))
-    app.add_handler(CommandHandler("olvidar_objetivo", olvidar_objetivo))
-    app.add_handler(CommandHandler("voz", voz))
-    app.add_handler(CommandHandler("tarea", tarea))
-    app.add_handler(CommandHandler("tareas", tareas))
-    app.add_handler(CommandHandler("analizar", analizar))
-    app.add_handler(CommandHandler("recon", recon_shortcut))
-    app.add_handler(CommandHandler("webscan", webscan_shortcut))
-    app.add_handler(CommandHandler("crack", crack_shortcut))
-    app.add_handler(CommandHandler("payload", payload_shortcut))
-    app.add_handler(CommandHandler("osint", osint_shortcut))
+    # Construir la aplicación nativa de python-telegram-bot
+    application = Application.builder().token(token).build()
 
-    app.add_handler(CallbackQueryHandler(handle_callback))
+    # Registrar tus manejadores de comandos tradicionales
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("objetivo", objetivo))
+    application.add_handler(CommandHandler("olvidar_objetivo", olvidar_objetivo))
+    application.add_handler(CommandHandler("voz", voz))
+    application.add_handler(CommandHandler("tarea", tarea))
+    application.add_handler(CommandHandler("tareas", tareas))
+    application.add_handler(CommandHandler("analizar", analizar))
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    # Manejador global de texto e interacción de menús
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    application.add_handler(CallbackQueryHandler(handle_callback))
 
-    log.info("Artenisa Telegram Bot v5.0 iniciando...")
-    app.run_polling()
-
+    print("[OK] Bot de Artenisa sincronizado y escuchando en Telegram...")
+    log.info("Bot de Telegram iniciado con éxito.")
+    
+    # Arrancar el polling de forma síncrona pura (rompe el congelamiento del contenedor)
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
+

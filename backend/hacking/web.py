@@ -223,6 +223,34 @@ def dir_bruteforce(url: str, wordlist: list = None) -> dict:
     found.sort(key=lambda x: x["path"])
     return {"target": url, "total_tried": len(wordlist), "found": found}
 
+def screenshot(url: str) -> dict:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return {"url": url, "success": False, "error": "Playwright no instalado"}
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+            )
+            page = browser.new_page(viewport={"width": 1280, "height": 720})
+            page.goto(url, wait_until="networkidle", timeout=30000)
+            title = page.title()
+            png_bytes = page.screenshot(full_page=True, type="png")
+            import base64
+            b64 = base64.b64encode(png_bytes).decode("utf-8")
+            browser.close()
+            return {
+                "url": url,
+                "success": True,
+                "title": title,
+                "screenshot_base64": b64,
+            }
+    except Exception as e:
+        return {"url": url, "success": False, "error": str(e)}
+
+
 def ssl_check(host: str, port: int = 443) -> dict:
     result = {"host": host, "port": port, "valid": False, "error": ""}
     try:

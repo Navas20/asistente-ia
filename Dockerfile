@@ -11,6 +11,7 @@ WORKDIR /app
 # Copiar el backend e instalar los requerimientos de Python
 COPY backend/ /app/
 RUN pip3 install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir playwright && playwright install --with-deps chromium
 
 # Crear directorios para datos, subidas y audios
 RUN mkdir -p data/uploads data/audio

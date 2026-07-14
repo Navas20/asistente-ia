@@ -34,6 +34,7 @@ PLAYBOOKS = {
         "depth_estimate": "lento",
         "steps": [
             {"id": "tech", "label": "Detección de Tecnologías", "tool": "detect_tech"},
+            {"id": "screenshot", "label": "Captura de Pantalla", "tool": "screenshot"},
             {"id": "headers", "label": "Análisis de Cabeceras", "tool": "check_headers"},
             {"id": "ssl", "label": "Verificación SSL/TLS", "tool": "ssl_check"},
             {"id": "sqli", "label": "Inyección SQL", "tool": "check_sqli"},

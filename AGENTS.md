@@ -1,27 +1,26 @@
-## Session 2026-06-28
+## Session 2026-07-14
 
 ### Done
-- Fixed backend `main.py` to read `AUTH_TOKEN` from `.env` alongside env var
-- Fixed CLI `asistente.py` to read `AUTH_TOKEN` from `backend/.env` automatically
-- Replaced all `shell=True` with `shlex.split()` across backend/main.py, llama_backend.py, workflows.py, CLI
-- Replaced bare `except:` with specific exceptions everywhere
-- Added `OLLAMA_TIMEOUT` env var (default 60s)
-- Added exponential backoff retry in llama_backend.py (2 attempts, sleep 2^n)
-- Added file upload validation: `ALLOWED_EXTENSIONS` + `MAX_UPLOAD_SIZE` (20MB)
-- Added CORS `ALLOWED_ORIGINS` env var (default localhost:5173,3000)
-- Default token `"cambia-este-token-urgentemente"` replaced with `os.urandom(32).hex()`
-- Installed Microsoft Visual C++ 2015-2022 Redistributable via `vc_redist.x64.exe`
-- Pushed all fixes to `main`
-- Committed files: backend/main.py, cli/asistente.py
-- Commit hash: `64a8fe7`
+- Instalado Graphify, generado grafo del proyecto (988 nodos, 79 comunidades)
+- Docker Desktop activado, contenedores `artenisa-backend` (puerto 8000) y `artenisa-telegram-bot` funcionando
+- Agregado DNS explícito (8.8.8.8, 1.1.1.1) a docker-compose.yml
+- `ALLOWED_USER_IDS` unificado a plural, Ollama removido del Dockerfile
+- Chat IA desde Telegram funciona con OpenRouter (`google/gemma-4-26b-a4b-it:free`)
+- Herramientas de hacking verificadas funcionales desde el backend
+- Playwright instalado en Dockerfile (Chromium descargado)
+- Integrado `screenshot()` como herramienta de hacking + paso en playbook `web_audit`
+- Modificado `/tarea` en Telegram para mostrar screenshot y resumen al completarse
+- Corregido Markdown malformado en respuestas del LLM (fallback a texto plano)
 
-### Blockers
-- Ollama llama-server crashes with: `exit status 0xc0000135: hs was not found`
-- VC++ Redistributable installed but old ollama process (PID 28872) can't be killed (no admin perms)
-- Need user to manually **restart Ollama** (system tray → Quit, reopen) or **reboot PC**
+### Files Modified This Session
+- `backend/hacking/web.py` — Nueva función `screenshot(url)` con Playwright
+- `backend/hacking/__init__.py` — Exportada `screenshot`
+- `backend/playbooks.py` — Paso `screenshot` agregado a `web_audit`
+- `backend/telegram_bot.py` — `/tarea` muestra resultados + foto
+- `docker-compose.yml` — DNS, variables de entorno
+- `Dockerfile` — Playwright + Chromium
+- `.env` — Token, modelo, `ALLOWED_USER_IDS`
 
 ### Next Steps
-- After Ollama restarts, test full chain: `curl http://localhost:11434/api/generate -d "{\"model\":\"personal\",\"prompt\":\"Hola\",\"stream\":false}"`
-- Start Artenisa backend: `cd backend && python main.py`
-- Start Artenisa CLI: `cd cli && python asistente.py`
-- If Ollama still fails, check if the model `personal` needs to be recreated
+- Probar web_audit desde Telegram: "🌐 Web" → URL → profundidad → `/tarea <id>`
+- Verificar screenshot se recibe como foto en el chat
