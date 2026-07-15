@@ -67,6 +67,34 @@ class ToolsEngineTests(unittest.TestCase):
             user_id=9,
         )
 
+    def test_validate_target_ipv6_cidrs_require_one_global_address(self):
+        rejected = (
+            "::/0",
+            "2000::/3",
+            "fc00::/6",
+            "2001:4860:4860::/64",
+            "::ffff:0:0/96",
+            "::ffff:8.8.8.0/120",
+            "::1/128",
+            "fc00::/7",
+            "fe80::/10",
+            "ff00::/8",
+            "ff00::1/128",
+            "::ffff:192.168.1.1/128",
+            "::ffff:127.0.0.1/128",
+        )
+
+        for target in rejected:
+            with self.subTest(target=target):
+                self.assertIsNotNone(tools_engine.validate_target(target))
+
+        self.assertIsNone(
+            tools_engine.validate_target("2001:4860:4860::8888")
+        )
+        self.assertIsNone(
+            tools_engine.validate_target("2001:4860:4860::8888/128")
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

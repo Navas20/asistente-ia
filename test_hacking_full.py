@@ -57,7 +57,8 @@ show("DNS MX", res.get("MX", [])[:3])
 
 test("subdomain_scan", subdomain_scan, "example.com")
 res = subdomain_scan("example.com")
-show("Subdomains", res[:5])
+subdomains = res.get("found", []) if isinstance(res, dict) else res
+show("Subdomains", subdomains[:5])
 
 test("whois_lookup", whois_lookup, "example.com")
 res = whois_lookup("example.com")

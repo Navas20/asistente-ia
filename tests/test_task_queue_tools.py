@@ -74,5 +74,58 @@ class TaskQueueToolTests(unittest.TestCase):
         self.assertIn("invalid option", queue._tasks["ABC123"]["error"])
 
 
+    # ─── Owner isolation tests ───
+
+    def test_get_status_with_matching_user_id_returns_task(self):
+        queue = make_queue()
+        task_id = queue.submit("nmap", "8.8.8.8", {"user_id": 7})
+        status = queue.get_status(task_id, user_id=7)
+        self.assertEqual(status["id"], task_id)
+        self.assertEqual(status["status"], "queued")
+
+    def test_get_status_with_wrong_user_id_returns_not_found(self):
+        queue = make_queue()
+        task_id = queue.submit("nmap", "8.8.8.8", {"user_id": 7})
+        status = queue.get_status(task_id, user_id=8)
+        self.assertEqual(status, {"error": "Tarea no encontrada"})
+
+    def test_get_status_without_user_id_still_returns_task(self):
+        queue = make_queue()
+        task_id = queue.submit("nmap", "8.8.8.8", {"user_id": 7})
+        status = queue.get_status(task_id)
+        self.assertEqual(status["id"], task_id)
+
+    def test_foreign_task_is_indistinguishable_from_missing(self):
+        queue = make_queue()
+        task_id = queue.submit("nmap", "8.8.8.8", {"user_id": 7})
+        missing = queue.get_status("NONEXIST", user_id=7)
+        foreign = queue.get_status(task_id, user_id=8)
+        self.assertEqual(missing, foreign)
+        self.assertEqual(missing, {"error": "Tarea no encontrada"})
+
+    def test_list_tasks_with_user_id_filters_tasks(self):
+        queue = make_queue()
+        queue.submit("nmap", "8.8.8.8", {"user_id": 7})
+        queue.submit("nmap", "8.8.8.9", {"user_id": 8})
+        queue.submit("nmap", "8.8.8.10", {"user_id": 7})
+        tasks = queue.list_tasks(user_id=7)
+        self.assertEqual(len(tasks), 2)
+        for t in tasks:
+            self.assertEqual(t["params"]["user_id"], 7)
+
+    def test_list_tasks_without_user_id_returns_all(self):
+        queue = make_queue()
+        queue.submit("nmap", "8.8.8.8", {"user_id": 7})
+        queue.submit("nmap", "8.8.8.9", {"user_id": 8})
+        tasks = queue.list_tasks()
+        self.assertEqual(len(tasks), 2)
+
+    def test_list_tasks_foreign_user_gets_empty_list(self):
+        queue = make_queue()
+        queue.submit("nmap", "8.8.8.8", {"user_id": 7})
+        tasks = queue.list_tasks(user_id=99)
+        self.assertEqual(tasks, [])
+
+
 if __name__ == "__main__":
     unittest.main()

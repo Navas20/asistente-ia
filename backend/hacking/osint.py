@@ -60,24 +60,47 @@ def email_osint(email: str) -> dict:
         "mx_records": [],
         "hibp_reference": f"https://haveibeenpwned.com/account/{email}",
         "dominio_info": {},
+        "status": "ok",
+        "warnings": [],
     }
+    dns_error = None
     try:
         import dns.resolver
         try:
             answers = dns.resolver.resolve(domain, "MX", lifetime=5)
             result["mx_records"] = [str(r.exchange) for r in answers]
-        except Exception:
+        except dns.resolver.NoAnswer:
             result["mx_records"] = []
+        except Exception as e:
+            result["mx_records"] = []
+            dns_error = f"MX lookup failed: {e}"
+            result["warnings"].append(dns_error)
     except ImportError:
         result["mx_records"] = ["dnspython no instalado"]
+        dns_error = "dnspython no instalado"
+        result["warnings"].append(dns_error)
+
+    http_error = None
     try:
         data = _fetch_json(f"https://crt.sh/?q=%25.{domain}&output=json", timeout=8)
         if isinstance(data, list):
             unique = sorted(set(item["name_value"].strip() for item in data if "name_value" in item))
             result["dominio_info"]["subdominios_cert"] = unique[:50]
             result["dominio_info"]["total_certs"] = len(data)
-    except (json.JSONDecodeError, urllib.error.URLError, urllib.error.HTTPError):
-        pass
+        elif isinstance(data, dict) and "error" in data:
+            http_error = f"Certificate transparency: {data['error']}"
+            result["warnings"].append(http_error)
+    except (json.JSONDecodeError, urllib.error.URLError, urllib.error.HTTPError) as e:
+        http_error = f"Certificate transparency: {e}"
+        result["warnings"].append(http_error)
+
+    if dns_error and http_error:
+        result["status"] = "error"
+    elif dns_error or http_error:
+        result["status"] = "partial"
+    else:
+        result["status"] = "ok"
+
     return result
 
 def cert_transparency(domain: str) -> list:

@@ -87,6 +87,14 @@ COMMON_DIRS = [
     "cgi-bin", "cgi-bin/status",
 ]
 
+
+def _transport_error(detail) -> str:
+    detail = str(detail).strip()
+    if detail:
+        return f"Error de transporte HTTP: {detail}"
+    return "Error de transporte HTTP: sin respuesta"
+
+
 def _http_get(url: str, timeout: float = 8.0) -> tuple:
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
     try:
@@ -118,10 +126,14 @@ def detect_tech(url: str) -> dict:
     detected["status"] = status
     detected["url"] = url
     detected["headers"] = {k: v for k, v in sorted(headers.items()) if k.lower() in {"server", "x-powered-by", "x-aspnet-version", "x-generator", "set-cookie", "content-type"}}
+    if status == 0:
+        detected["error"] = _transport_error(body)
     return detected
 
 def check_sqli(url: str, param: str) -> dict:
     results = {"url": url, "param": param, "error_based": False, "time_based": False, "vulnerable": False, "details": []}
+    transport_errors = []
+    responses = 0
     for payload in SQLI_PAYLOADS_ERROR:
         try:
             parsed = list(urllib.parse.urlparse(url))
@@ -130,13 +142,18 @@ def check_sqli(url: str, param: str) -> dict:
             parsed[4] = urllib.parse.urlencode(qs, doseq=True)
             test_url = urllib.parse.urlunparse(parsed)
             status, headers, body = _http_get(test_url)
+            if status == 0:
+                transport_errors.append(_transport_error(body))
+                continue
+            responses += 1
             for err_pat in SQL_ERRORS:
                 if re.search(err_pat, body, re.IGNORECASE):
                     results["error_based"] = True
                     results["vulnerable"] = True
                     results["details"].append({"tipo": "error_based", "payload": payload, "error": err_pat})
                     break
-        except Exception:
+        except Exception as e:
+            transport_errors.append(_transport_error(e))
             continue
     for payload in SQLI_PAYLOADS_TIME:
         try:
@@ -146,19 +163,30 @@ def check_sqli(url: str, param: str) -> dict:
             parsed[4] = urllib.parse.urlencode(qs, doseq=True)
             test_url = urllib.parse.urlunparse(parsed)
             t0 = __import__("time").time()
-            _http_get(test_url, timeout=6.0)
+            status, _, body = _http_get(test_url, timeout=6.0)
             elapsed = __import__("time").time() - t0
+            if status == 0:
+                transport_errors.append(_transport_error(body))
+                continue
+            responses += 1
             if elapsed > 2.0:
                 results["time_based"] = True
                 results["vulnerable"] = True
                 results["details"].append({"tipo": "time_based", "payload": payload, "elapsed": round(elapsed, 2)})
                 break
-        except Exception:
+        except Exception as e:
+            transport_errors.append(_transport_error(e))
             continue
+    if transport_errors:
+        results["failed_requests"] = len(transport_errors)
+    if responses == 0 and transport_errors:
+        results["error"] = transport_errors[0]
     return results
 
 def check_xss(url: str, param: str) -> dict:
     results = {"url": url, "param": param, "vulnerable": False, "details": []}
+    transport_errors = []
+    responses = 0
     for payload in XSS_PAYLOADS:
         try:
             parsed = list(urllib.parse.urlparse(url))
@@ -167,16 +195,27 @@ def check_xss(url: str, param: str) -> dict:
             parsed[4] = urllib.parse.urlencode(qs, doseq=True)
             test_url = urllib.parse.urlunparse(parsed)
             status, headers, body = _http_get(test_url)
+            if status == 0:
+                transport_errors.append(_transport_error(body))
+                continue
+            responses += 1
             if payload in body:
                 results["vulnerable"] = True
                 results["details"].append({"payload": payload[:60], "reflected": True})
                 break
-        except Exception:
+        except Exception as e:
+            transport_errors.append(_transport_error(e))
             continue
+    if transport_errors:
+        results["failed_requests"] = len(transport_errors)
+    if responses == 0 and transport_errors:
+        results["error"] = transport_errors[0]
     return results
 
 def check_lfi(url: str, param: str) -> dict:
     results = {"url": url, "param": param, "vulnerable": False, "details": []}
+    transport_errors = []
+    responses = 0
     for payload in LFI_PAYLOADS:
         try:
             parsed = list(urllib.parse.urlparse(url))
@@ -185,13 +224,22 @@ def check_lfi(url: str, param: str) -> dict:
             parsed[4] = urllib.parse.urlencode(qs, doseq=True)
             test_url = urllib.parse.urlunparse(parsed)
             status, headers, body = _http_get(test_url)
+            if status == 0:
+                transport_errors.append(_transport_error(body))
+                continue
+            responses += 1
             for pat in LFI_PATTERNS:
                 if re.search(pat, body, re.IGNORECASE):
                     results["vulnerable"] = True
                     results["details"].append({"payload": payload, "matched": pat, "preview": body[:200]})
                     return results
-        except Exception:
+        except Exception as e:
+            transport_errors.append(_transport_error(e))
             continue
+    if transport_errors:
+        results["failed_requests"] = len(transport_errors)
+    if responses == 0 and transport_errors:
+        results["error"] = transport_errors[0]
     return results
 
 def dir_bruteforce(url: str, wordlist: list = None) -> dict:
@@ -199,7 +247,9 @@ def dir_bruteforce(url: str, wordlist: list = None) -> dict:
         wordlist = COMMON_DIRS
     base = url.rstrip("/")
     found = []
-    def _check_dir(path: str) -> dict | None:
+    transport_errors = []
+
+    def _check_dir(path: str) -> tuple[dict | None, str | None]:
         full = f"{base}/{path}"
         try:
             req = urllib.request.Request(full, method="HEAD", headers={"User-Agent": "Mozilla/5.0"})
@@ -207,21 +257,28 @@ def dir_bruteforce(url: str, wordlist: list = None) -> dict:
             ctx.check_hostname = False
             ctx.verify_mode = ssl_mod.CERT_NONE
             with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
-                return {"path": f"/{path}", "status": resp.status, "size": resp.headers.get("Content-Length", "")}
+                return {"path": f"/{path}", "status": resp.status, "size": resp.headers.get("Content-Length", "")}, None
         except urllib.error.HTTPError as e:
             if e.code in (200, 301, 302, 403, 401, 500):
-                return {"path": f"/{path}", "status": e.code, "size": str(e.headers.get("Content-Length", ""))}
-            return None
-        except Exception:
-            return None
+                return {"path": f"/{path}", "status": e.code, "size": str(e.headers.get("Content-Length", ""))}, None
+            return None, None
+        except Exception as e:
+            return None, _transport_error(e)
     with ThreadPoolExecutor(max_workers=15) as executor:
         futuros = {executor.submit(_check_dir, d): d for d in wordlist}
         for fut in as_completed(futuros):
-            r = fut.result()
+            r, transport_error = fut.result()
             if r:
                 found.append(r)
+            if transport_error:
+                transport_errors.append(transport_error)
     found.sort(key=lambda x: x["path"])
-    return {"target": url, "total_tried": len(wordlist), "found": found}
+    result = {"target": url, "total_tried": len(wordlist), "found": found}
+    if transport_errors:
+        result["failed_requests"] = len(transport_errors)
+    if wordlist and len(transport_errors) == len(wordlist):
+        result["error"] = transport_errors[0]
+    return result
 
 def screenshot(url: str) -> dict:
     try:

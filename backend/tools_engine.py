@@ -140,8 +140,22 @@ def validate_target(target: str) -> str | None:
     except ValueError:
         try:
             ip = ipaddress.ip_network(target, strict=False)
+            if ip.version == 6:
+                if ip.prefixlen != 128:
+                    return (
+                        f"Rango IPv6 '{target}' no soportado: "
+                        "usa una sola dirección /128"
+                    )
+                address = ip.network_address
+                if not address.is_global or address.is_multicast:
+                    return f"Rango IPv6 no global '{target}' no permitido"
+                return None
             for blocked in BLOCKED_RANGES:
-                if ip.overlaps(ipaddress.ip_network(blocked)):
+                blocked_network = ipaddress.ip_network(blocked)
+                if (
+                    ip.version == blocked_network.version
+                    and ip.overlaps(blocked_network)
+                ):
                     return f"Rango '{target}' está en rango bloqueado: {blocked}"
             return None
         except ValueError:

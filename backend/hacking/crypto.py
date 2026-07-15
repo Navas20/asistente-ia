@@ -45,28 +45,29 @@ def hash_crack(hash_str: str, wordlist: list = None) -> dict:
     identified = hash_id(hash_str)
     algo = identified[0]["type"] if identified else "desconocido"
     result = {"hash": hash_str, "identified": identified, "cracked": False, "plaintext": None, "algorithm": algo}
+    comparison_hash = hash_str.casefold()
     for word in wordlist:
-        if algo == "MD5" and hashlib.md5(word.encode()).hexdigest() == hash_str:
+        if algo == "MD5" and hashlib.md5(word.encode()).hexdigest() == comparison_hash:
             result["cracked"] = True
             result["plaintext"] = word
             break
-        if algo == "SHA1" and hashlib.sha1(word.encode()).hexdigest() == hash_str:
+        if algo == "SHA1" and hashlib.sha1(word.encode()).hexdigest() == comparison_hash:
             result["cracked"] = True
             result["plaintext"] = word
             break
-        if algo == "SHA224" and hashlib.sha224(word.encode()).hexdigest() == hash_str:
+        if algo == "SHA224" and hashlib.sha224(word.encode()).hexdigest() == comparison_hash:
             result["cracked"] = True
             result["plaintext"] = word
             break
-        if algo == "SHA256" and hashlib.sha256(word.encode()).hexdigest() == hash_str:
+        if algo == "SHA256" and hashlib.sha256(word.encode()).hexdigest() == comparison_hash:
             result["cracked"] = True
             result["plaintext"] = word
             break
-        if algo == "SHA384" and hashlib.sha384(word.encode()).hexdigest() == hash_str:
+        if algo == "SHA384" and hashlib.sha384(word.encode()).hexdigest() == comparison_hash:
             result["cracked"] = True
             result["plaintext"] = word
             break
-        if algo == "SHA512" and hashlib.sha512(word.encode()).hexdigest() == hash_str:
+        if algo == "SHA512" and hashlib.sha512(word.encode()).hexdigest() == comparison_hash:
             result["cracked"] = True
             result["plaintext"] = word
             break

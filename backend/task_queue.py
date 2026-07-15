@@ -52,17 +52,25 @@ class TaskQueue:
         logger.info("Tarea %s encolada: %s %s", task_id, task_type, target)
         return task_id
 
-    def get_status(self, task_id):
+    def get_status(self, task_id, user_id=None):
         with self._lock:
             task = self._tasks.get(task_id)
         if task is None:
             return {"error": "Tarea no encontrada"}
+        if user_id is not None and task.get("params", {}).get("user_id") != user_id:
+            return {"error": "Tarea no encontrada"}
         return dict(task)
 
-    def list_tasks(self, limit=10):
+    def list_tasks(self, limit=10, user_id=None):
         with self._lock:
+            tasks = self._tasks.values()
+            if user_id is not None:
+                tasks = [
+                    t for t in tasks
+                    if t.get("params", {}).get("user_id") == user_id
+                ]
             sorted_tasks = sorted(
-                self._tasks.values(),
+                tasks,
                 key=lambda t: t["created_at"],
                 reverse=True,
             )
@@ -183,6 +191,9 @@ class TaskQueue:
                 progress_callback=progress_callback,
             )
 
+            if result.get("error"):
+                self.fail(task_id, result["error"])
+                return
             self.complete(task_id, result)
         except Exception as e:
             logger.exception("Error en playbook task %s", task_id)

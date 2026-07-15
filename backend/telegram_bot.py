@@ -1,12 +1,18 @@
 import os
 import asyncio
+import ipaddress
 import logging
+import re
+import secrets
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 from target_engine import TargetEngine
@@ -16,6 +22,7 @@ from security import AuditLog, RateLimiter, get_role
 from playbooks import list_playbooks
 from report_generator import generate_report
 import hacking
+import tools_engine
 
 log = logging.getLogger("artenisa.telegram")
 
@@ -29,6 +36,59 @@ task_queue = TaskQueue()
 audit_log = AuditLog()
 rate_limiter = RateLimiter()
 user_wizards = {}
+
+WIZARD_TTL_SECONDS = 30 * 60
+
+
+def _new_wizard(uid, wizard_type, chat_id, step="select_type", **state):
+    wizard = {
+        "session_id": secrets.token_hex(4),
+        "type": wizard_type,
+        "step": step,
+        "chat_id": chat_id,
+        "created_at": time.time(),
+        "target": None,
+        "data": {},
+    }
+    wizard.update(state)
+    user_wizards[uid] = wizard
+    log.info(
+        "Wizard session created: user=%s type=%s session=%s",
+        uid,
+        wizard_type,
+        wizard["session_id"],
+    )
+    return wizard
+
+
+def _is_wizard_expired(uid, now=None):
+    wizard = user_wizards.get(uid)
+    if not wizard:
+        return False
+    current_time = time.time() if now is None else now
+    if current_time - wizard.get("created_at", 0) <= WIZARD_TTL_SECONDS:
+        return False
+    user_wizards.pop(uid, None)
+    log.info("Wizard session expired: user=%s", uid)
+    return True
+
+
+def _consume_wizard(uid, session_id):
+    wizard = user_wizards.get(uid)
+    if not wizard or wizard.get("session_id") != session_id:
+        return None
+    return user_wizards.pop(uid)
+
+
+def _wizard_callback(wizard, action, value):
+    callback = (
+        f"w:{wizard['session_id']}:{wizard['type']}:{action}:{value}"
+    )
+    if len(callback.encode("utf-8")) > 64:
+        raise ValueError("Telegram callback_data exceeds 64 bytes")
+    return callback
+
+
 user_depths = {}
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
@@ -56,23 +116,51 @@ def _username(update: Update) -> str:
     return u.username or u.full_name or str(u.id)
 
 
-def _recon_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("\U0001f310 Dominio", callback_data="wizard:recon:dominio"),
-         InlineKeyboardButton("\U0001f5a5\ufe0f IP", callback_data="wizard:recon:ip")],
-        [InlineKeyboardButton("\U0001f4e1 Rango de Red", callback_data="wizard:recon:red"),
-         InlineKeyboardButton("\U0001f519 Atr\u00e1s", callback_data="menu:main")],
-    ])
+def _is_markdown_parse_error(exc):
+    message = str(exc).casefold()
+    return any(
+        marker in message
+        for marker in (
+            "can't parse entities",
+            "cannot parse entities",
+            "can not parse entities",
+        )
+    )
 
 
-def _depth_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("\u26a1 R\u00e1pido", callback_data="depth:rapido"),
-         InlineKeyboardButton("\U0001f50e Normal", callback_data="depth:normal"),
-         InlineKeyboardButton("\U0001f9e0 Profundo", callback_data="depth:profundo")],
-        [InlineKeyboardButton("\U0001f519 Atr\u00e1s", callback_data="menu:main"),
-         InlineKeyboardButton("\u274c Cancelar", callback_data="action:cancel")],
-    ])
+def _is_message_not_modified(exc):
+    return "message is not modified" in str(exc).casefold()
+
+
+async def _safe_telegram_call(method, text, **kwargs):
+    try:
+        return await method(text, **kwargs)
+    except BadRequest as exc:
+        if "parse_mode" not in kwargs or not _is_markdown_parse_error(exc):
+            log.error("Telegram BadRequest: %s", exc)
+            raise
+        fallback = dict(kwargs)
+        fallback.pop("parse_mode", None)
+        log.warning("Telegram Markdown parse failed; retrying as plain text")
+        try:
+            return await method(text, **fallback)
+        except BadRequest as fallback_exc:
+            log.error(
+                "Telegram plain-text fallback failed: %s", fallback_exc
+            )
+            raise
+
+
+async def _safe_reply_text(message, text, **kwargs):
+    return await _safe_telegram_call(message.reply_text, text, **kwargs)
+
+
+async def _safe_edit_text(message, text, **kwargs):
+    return await _safe_telegram_call(message.edit_text, text, **kwargs)
+
+
+async def _safe_edit_message(query, text, **kwargs):
+    return await _safe_telegram_call(query.edit_message_text, text, **kwargs)
 
 
 # ─── Command Handlers ───
@@ -83,11 +171,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_role(uid):
         await update.message.reply_text("\u274c No autorizado")
         return
+    user_wizards.pop(uid, None)
     summary = target_engine.get_context_summary(uid)
     msg = "\U0001f3af *Artenisa v5.0 en l\u00ednea*\n\nSelecciona una operaci\u00f3n del men\u00fa:"
     if summary:
         msg += f"\n\n{summary}"
-    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+    await _safe_reply_text(
+        update.message,
+        msg,
+        parse_mode="Markdown",
+        reply_markup=MAIN_KEYBOARD,
+    )
 
 
 async def objetivo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -105,7 +199,11 @@ async def objetivo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     target_engine.set_target(uid, target, "manual")
     audit_log.log(uid, _username(update), "/objetivo", target)
-    await update.message.reply_text(f"\u2705 Objetivo establecido: `{target}`", parse_mode="Markdown")
+    await _safe_reply_text(
+        update.message,
+        f"\u2705 Objetivo establecido: `{target}`",
+        parse_mode="Markdown",
+    )
 
 
 async def olvidar_objetivo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -127,7 +225,7 @@ async def tarea(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Uso: /tarea <id>")
         return
     tid = context.args[0]
-    status = task_queue.get_status(tid)
+    status = task_queue.get_status(tid, user_id=uid)
     if "error" in status:
         await update.message.reply_text(f"\u274c {status['error']}")
         return
@@ -158,7 +256,7 @@ async def tarea(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 elif data.get("error"):
                     msg += f"\n\u26a0\ufe0f Screenshot: {data['error']}"
 
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await _safe_reply_text(update.message, msg, parse_mode="Markdown")
 
 
 async def tareas(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -166,7 +264,7 @@ async def tareas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_role(uid):
         await update.message.reply_text("\u274c No autorizado")
         return
-    tasks = task_queue.list_tasks()
+    tasks = task_queue.list_tasks(user_id=uid)
     if not tasks:
         await update.message.reply_text("\U0001f4ed No hay tareas.")
         return
@@ -175,104 +273,119 @@ async def tareas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for t in tasks:
         icon = icons.get(t["status"], "\u2753")
         lines.append(f"{icon} `{t['id']}` {t['type']} \u2192 {t['target']} ({t['status']})")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def recon_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not _check_role(uid):
-        await update.message.reply_text("\u274c No autorizado")
-        return
-    target = " ".join(context.args)
-    if not target:
-        await update.message.reply_text("Uso: /recon <dominio>")
-        return
-    user_wizards[uid] = {"type": "recon", "target": target, "step": "awaiting_depth"}
-    await update.message.reply_text("Selecciona profundidad:", reply_markup=_depth_keyboard())
+    await _safe_reply_text(
+        update.message, "\n".join(lines), parse_mode="Markdown"
+    )
 
 
 async def nmap_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     log.info("[nmap] Handler called by %s, args=%s", uid, context.args)
-    try:
-        if not _check_role(uid):
-            await update.message.reply_text("\u274c No autorizado")
-            return
-        rl = _rate_limit_msg(uid)
-        if rl:
-            await update.message.reply_text(rl)
-            return
+    if not _check_role(uid):
+        await update.message.reply_text("\u274c No autorizado")
+        return
+    rl = _rate_limit_msg(uid)
+    if rl:
+        await update.message.reply_text(rl)
+        return
 
-        valid_types = {"quick", "normal", "full", "vuln"}
-        target = None
-        scan_type = "normal"
+    valid_types = {"quick", "normal", "full", "vuln"}
+    target = None
+    scan_type = "normal"
 
-        args = context.args or []
-        if len(args) == 0:
+    args = context.args or []
+    if len(args) == 0:
+        target_info = target_engine.get_target(uid)
+        if not target_info:
+            await update.message.reply_text("\u274c No hay objetivo. Usa /objetivo <target> primero.")
+            return
+        target = target_info["target"]
+
+    elif len(args) == 1:
+        if args[0] in valid_types:
+            scan_type = args[0]
             target_info = target_engine.get_target(uid)
             if not target_info:
-                await update.message.reply_text("\u274c No hay objetivo. Usa /objetivo <target> primero.")
+                await update.message.reply_text("\u274c No hay objetivo. Usa /objetivo <target> primero o /nmap <scan_type> <target>")
                 return
             target = target_info["target"]
-
-        elif len(args) == 1:
-            if args[0] in valid_types:
-                scan_type = args[0]
-                target_info = target_engine.get_target(uid)
-                if not target_info:
-                    await update.message.reply_text("\u274c No hay objetivo. Usa /objetivo <target> primero o /nmap <scan_type> <target>")
-                    return
-                target = target_info["target"]
-            else:
-                target = args[0]
-
         else:
-            scan_type = args[0]
-            if scan_type not in valid_types:
-                await update.message.reply_text(f"scan_type debe ser uno de: {', '.join(sorted(valid_types))}")
-                return
-            target = args[1]
+            target = args[0]
 
-        from tools_engine import validate_target
-        error = validate_target(target)
-        if error:
-            await update.message.reply_text(f"\u274c {error}")
+    else:
+        scan_type = args[0]
+        if scan_type not in valid_types:
+            await update.message.reply_text(f"scan_type debe ser uno de: {', '.join(sorted(valid_types))}")
             return
+        target = args[1]
 
+    from tools_engine import validate_target
+    error = validate_target(target)
+    if error:
+        await update.message.reply_text(f"\u274c {error}")
+        return
+
+    task_error = None
+    try:
         log.info("[nmap] Submitting: %s (%s)", target, scan_type)
         task_id = task_queue.submit("nmap", target, {"scan_type": scan_type, "user_id": uid})
         log.info("[nmap] Task ID: %s", task_id)
-
         if not task_id:
-            await update.message.reply_text("\u274c Error al encolar tarea")
-            return
+            task_error = "\u274c Error al encolar tarea"
+        else:
+            audit_log.log(
+                uid,
+                _username(update),
+                "/nmap",
+                target,
+                "ok",
+                f"task:{task_id}",
+            )
+    except Exception as exc:
+        log.error("[nmap] Exception: %s", exc, exc_info=True)
+        task_error = f"\u274c Error: {str(exc)}"
 
-        audit_log.log(uid, _username(update), "/nmap", target, "ok", f"task:{task_id}")
+    if task_error:
+        await update.message.reply_text(task_error)
+        return
 
-        msg = await update.message.reply_text(
-            f"\u2705 `{task_id}` \u2014 Escaneando {target} ({scan_type})",
-            parse_mode="Markdown"
-        )
-
-        asyncio.create_task(_poll_nmap_task(msg, task_id))
-
-    except Exception as e:
-        log.error("[nmap] Exception: %s", e, exc_info=True)
-        try:
-            await update.message.reply_text(f"\u274c Error: {str(e)}")
-        except Exception:
-            pass
+    msg = await _safe_reply_text(
+        update.message,
+        f"\u2705 `{task_id}` \u2014 Escaneando {target} ({scan_type})",
+        parse_mode="Markdown",
+    )
+    asyncio.create_task(_poll_nmap_task(msg, task_id))
 
 
-async def _poll_nmap_task(msg, task_id, timeout=300):
+async def _poll_nmap_task(
+    msg, task_id, timeout=300, return_to_menu=False
+):
     await asyncio.sleep(2)
     deadline = asyncio.get_event_loop().time() + timeout
+    last_progress_text = None
     while True:
         status = task_queue.get_status(task_id)
-        if "error" in status:
+        s = status.get("status")
+        if not s:
+            error = status.get("error") or "Tarea no encontrada"
+            await _safe_edit_text(msg, f"\u274c Nmap: {error}")
+            if return_to_menu:
+                await _safe_reply_text(
+                    msg,
+                    "Menú principal:",
+                    reply_markup=MAIN_KEYBOARD,
+                )
             return
 
-        s = status["status"]
+        if s == "cancelled":
+            await _safe_edit_text(msg, "\u274c Nmap: tarea cancelada")
+            if return_to_menu:
+                await _safe_reply_text(
+                    msg,
+                    "Menú principal:",
+                    reply_markup=MAIN_KEYBOARD,
+                )
+            return
 
         if s == "completed":
             result = status.get("result") or {}
@@ -299,95 +412,855 @@ async def _poll_nmap_task(msg, task_id, timeout=300):
             else:
                 out = stdout[:1500] if stdout else "(sin salida)"
                 lines.append(f"\n```\n{out}\n```")
-            try:
-                await msg.edit_text("\n".join(lines), parse_mode="Markdown")
-            except Exception:
-                pass
+            await _safe_edit_text(
+                msg, "\n".join(lines), parse_mode="Markdown"
+            )
+            if return_to_menu:
+                await _safe_reply_text(
+                    msg,
+                    "Men\u00fa principal:",
+                    reply_markup=MAIN_KEYBOARD,
+                )
             return
 
         elif s == "failed":
             error = status.get("error", "Error desconocido")
-            try:
-                await msg.edit_text(f"\u274c Nmap fall\u00f3: {error}")
-            except Exception:
-                pass
+            await _safe_edit_text(msg, f"\u274c Nmap fall\u00f3: {error}")
+            if return_to_menu:
+                await _safe_reply_text(
+                    msg,
+                    "Men\u00fa principal:",
+                    reply_markup=MAIN_KEYBOARD,
+                )
             return
 
         elif s == "running":
             pct = status.get("progress", 0)
-            try:
-                await msg.edit_text(
-                    f"\u23f3 `{task_id}` \u2014 {pct}%",
-                    parse_mode="Markdown"
-                )
-            except Exception:
-                pass
+            filled = max(0, min(10, int(pct) // 10))
+            bar = "\u2588" * filled + "\u2591" * (10 - filled)
+            step = status.get("current_step") or "Procesando..."
+            progress_text = (
+                f"\u23f3 `{task_id}` \u2014 [{bar}] {pct}%\n"
+                f"\U0001f527 {step}"
+            )
+            if progress_text != last_progress_text:
+                try:
+                    await _safe_edit_text(
+                        msg,
+                        progress_text,
+                        parse_mode="Markdown",
+                    )
+                except BadRequest as exc:
+                    if not _is_message_not_modified(exc):
+                        raise
+                    log.debug(
+                        "Nmap progress was already current: task=%s",
+                        task_id,
+                    )
+                last_progress_text = progress_text
 
         if asyncio.get_event_loop().time() > deadline:
-            try:
-                await msg.edit_text(f"\u23f0 `{task_id}` \u2014 Tiempo agotado ({timeout}s)")
-            except Exception:
-                pass
+            await _safe_edit_text(
+                msg,
+                f"\u23f0 `{task_id}` \u2014 Tiempo agotado ({timeout}s)",
+            )
+            if return_to_menu:
+                await _safe_reply_text(
+                    msg,
+                    "Men\u00fa principal:",
+                    reply_markup=MAIN_KEYBOARD,
+                )
             return
 
         await asyncio.sleep(2)
 
 
-async def webscan_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+async def _poll_playbook_task(
+    msg, task_id, label, timeout=600, return_to_menu=False, uid=None
+):
+    await asyncio.sleep(2)
+    deadline = asyncio.get_event_loop().time() + timeout
+    last_progress_text = None
+
+    async def finish(text):
+        await _safe_edit_text(msg, text)
+        if return_to_menu:
+            await _safe_reply_text(
+                msg,
+                "Menú principal:",
+                reply_markup=MAIN_KEYBOARD,
+            )
+
+    while True:
+        status = task_queue.get_status(task_id)
+        state = status.get("status")
+
+        if not state:
+            error = status.get("error") or "Tarea no encontrada"
+            await finish(f"{label}: {error}")
+            return
+
+        if state == "cancelled":
+            await finish(f"{label}: tarea cancelada")
+            return
+
+        if state == "completed":
+            result = status.get("result") or {}
+            target = status.get("target") or result.get("target") or ""
+
+            def clip(value, limit):
+                text = str(value)
+                if len(text) <= limit:
+                    return text
+                return text[:limit - 3] + "..."
+
+            lines = [
+                f"{clip(label, 120)} completado",
+                f"Objetivo: {clip(target, 500)}",
+            ]
+            summary = result.get("summary")
+            if summary:
+                lines.extend(("", clip(summary, 500)))
+            results = result.get("results") or []
+            if results:
+                lines.extend(("", "Resultados:"))
+                for step_result in results:
+                    step_status = (
+                        "OK" if step_result.get("success") else "SKIP"
+                    )
+                    step_label = clip(
+                        step_result.get("label") or "", 120
+                    )
+                    step_line = f"[{step_status}] {step_label}"
+                    note = step_result.get("note")
+                    if note:
+                        step_line += f" - {clip(note, 80)}"
+                    lines.append(step_line)
+            completion = "\n".join(lines)
+            if len(completion) > 3500:
+                completion = completion[:3497] + "..."
+            if uid:
+                ok_count = sum(1 for r in results if r.get("success"))
+                audit_status = "ok" if ok_count == len(results) else "partial"
+                params = status.get("params") or {}
+                task_target = status.get("target") or ""
+                audit_log.log(
+                    uid,
+                    str(uid),
+                    "wizard:osint",
+                    task_target,
+                    audit_status,
+                    f"task:{task_id} ok:{ok_count}/{len(results)}",
+                )
+            await finish(completion)
+            return
+
+        if state == "failed":
+            error = status.get("error") or "Error desconocido"
+            if uid:
+                task_target = status.get("target") or ""
+                audit_log.log(
+                    uid,
+                    str(uid),
+                    "wizard:osint",
+                    task_target,
+                    "error",
+                    f"task:{task_id} error:{error}",
+                )
+            await finish(f"{label} falló: {error}")
+            return
+
+        if state in {"queued", "running"}:
+            pct = status.get("progress", 0)
+            filled = max(0, min(10, int(pct) // 10))
+            bar = "\u2588" * filled + "\u2591" * (10 - filled)
+            step = status.get("current_step") or "Sin paso reportado"
+            progress_text = (
+                f"\u23f3 `{task_id}` \u2014 [{bar}] {pct}%\n"
+                f"\U0001f527 {step}"
+            )
+            if progress_text != last_progress_text:
+                try:
+                    await _safe_edit_text(
+                        msg,
+                        progress_text,
+                        parse_mode="Markdown",
+                    )
+                except BadRequest as exc:
+                    if not _is_message_not_modified(exc):
+                        raise
+                    log.debug(
+                        "Playbook progress was already current: task=%s",
+                        task_id,
+                    )
+                last_progress_text = progress_text
+
+        if asyncio.get_event_loop().time() > deadline:
+            await finish(
+                f"\u23f0 `{task_id}` \u2014 Tiempo agotado ({timeout}s)"
+            )
+            return
+
+        await asyncio.sleep(2)
+
+
+# ─── Wizard Keyboards ───
+
+
+def _wizard_keyboard(
+    wizard: dict, options: list[tuple[str, str, str]]
+):
+    buttons = [
+        InlineKeyboardButton(
+            label,
+            callback_data=_wizard_callback(wizard, action, value),
+        )
+        for label, action, value in options
+    ]
+    rows = [
+        buttons[index:index + 2]
+        for index in range(0, len(buttons), 2)
+    ]
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "\U0001f519 Atr\u00e1s",
+                callback_data=_wizard_callback(wizard, "back", "main"),
+            ),
+            InlineKeyboardButton(
+                "\u274c Cancelar",
+                callback_data=_wizard_callback(wizard, "cancel", "now"),
+            ),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+_CALLBACK_RULES = {
+    ("recon", "select_type", "type"): {"quick", "normal", "full"},
+    ("web", "select_type", "type"): {"recon", "vuln"},
+    ("crack", "select_type", "type"): {"hash"},
+    ("crack", "select_dict", "method"): {"integrated", "custom"},
+    ("payload", "select_type", "type"): {"reverse", "webshell"},
+    ("payload", "select_lang", "lang"): {"bash", "php"},
+    ("red", "select_type", "type"): {"quick", "normal", "full"},
+    ("osint", "select_type", "type"): {"email", "domain"},
+}
+
+
+_EXPIRED_CALLBACK_ALERT = (
+    "Este boton ya expiro. Abre un nuevo wizard desde el menu."
+)
+
+
+def _validate_wizard_callback(
+    uid: int, chat_id: int, data: str
+) -> tuple[
+    dict | None,
+    str | None,
+    str | None,
+    tuple[str, str] | None,
+]:
     if not _check_role(uid):
-        await update.message.reply_text("\u274c No autorizado")
-        return
-    target = " ".join(context.args)
-    if not target:
-        await update.message.reply_text("Uso: /webscan <url>")
-        return
-    user_wizards[uid] = {"type": "web", "target": target, "step": "awaiting_depth"}
-    await update.message.reply_text("Selecciona profundidad:", reply_markup=_depth_keyboard())
+        return None, None, None, ("unauthorized", "No autorizado")
+    rate_limit_error = _rate_limit_msg(uid)
+    if rate_limit_error:
+        return None, None, None, ("rate_limited", rate_limit_error)
+    if not isinstance(data, str) or len(data.encode("utf-8")) > 64:
+        return None, None, None, ("malformed_data", _EXPIRED_CALLBACK_ALERT)
+    parts = data.split(":")
+    if (
+        len(parts) != 5
+        or parts[0] != "w"
+        or not re.fullmatch(r"[0-9a-f]{8}", parts[1])
+    ):
+        return None, None, None, ("malformed_data", _EXPIRED_CALLBACK_ALERT)
+    _, session_id, wizard_type, action, value = parts
+    if _is_wizard_expired(uid):
+        return None, None, None, ("expired_session", _EXPIRED_CALLBACK_ALERT)
+    wizard = user_wizards.get(uid)
+    if not wizard:
+        return None, None, None, ("no_session", _EXPIRED_CALLBACK_ALERT)
+    if wizard.get("session_id") != session_id:
+        return None, None, None, ("session_mismatch", _EXPIRED_CALLBACK_ALERT)
+    if wizard.get("type") != wizard_type:
+        return None, None, None, (
+            "wizard_type_mismatch",
+            _EXPIRED_CALLBACK_ALERT,
+        )
+    if wizard.get("chat_id") != chat_id:
+        return None, None, None, ("chat_mismatch", _EXPIRED_CALLBACK_ALERT)
+    if action == "back" and value == "main":
+        return wizard, action, value, None
+    if action == "cancel" and value == "now":
+        return wizard, action, value, None
+    allowed = _CALLBACK_RULES.get(
+        (wizard_type, wizard.get("step"), action)
+    )
+    if not allowed or value not in allowed:
+        return None, None, None, ("invalid_selection", _EXPIRED_CALLBACK_ALERT)
+    if wizard_type == "payload" and action == "lang":
+        language_sets = {
+            "reverse": {"bash", "python", "php", "powershell"},
+            "webshell": {"php", "asp", "aspx", "jsp", "py"},
+        }
+        if value not in language_sets.get(
+            wizard.get("payload_type"), set()
+        ):
+            return None, None, None, (
+                "invalid_payload_language",
+                _EXPIRED_CALLBACK_ALERT,
+            )
+    return wizard, action, value, None
 
 
-async def crack_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not _check_role(uid):
-        await update.message.reply_text("\u274c No autorizado")
-        return
-    target = " ".join(context.args)
-    if not target:
-        await update.message.reply_text("Uso: /crack <hash>")
-        return
-    result = hacking.crypto.hash_crack(target)
-    await update.message.reply_text(_format_crack(result), parse_mode="Markdown")
+async def _reject_callback(
+    query, reason, message, uid=None, chat_id=None
+):
+    log.warning(
+        "Telegram callback rejected: reason=%s user=%s chat=%s data=%r",
+        reason,
+        uid,
+        chat_id,
+        getattr(query, "data", None),
+    )
+    try:
+        await query.answer(message, show_alert=True)
+    except Exception:
+        log.warning(
+            "Could not answer rejected Telegram callback", exc_info=True
+        )
 
 
-async def payload_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not _check_role(uid):
-        await update.message.reply_text("\u274c No autorizado")
-        return
-    target = " ".join(context.args)
-    if not target:
-        await update.message.reply_text("Uso: /payload <ip:puerto>\nEj: /payload 10.0.0.1:4444")
-        return
-    parts = target.split(":")
-    if len(parts) != 2:
-        await update.message.reply_text("\u274c Formato: ip:puerto (ej: 10.0.0.1:4444)")
-        return
-    ip, port = parts[0], parts[1]
-    result = hacking.payloads.reverse_shell(ip, int(port))
-    await update.message.reply_text(_format_payload(result), parse_mode="Markdown")
+async def _send_expired_callback(query):
+    await _reject_callback(
+        query, "session_unavailable", _EXPIRED_CALLBACK_ALERT
+    )
 
 
-async def osint_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not _check_role(uid):
-        await update.message.reply_text("\u274c No autorizado")
+# ─── Recon Wizard ───
+
+
+async def _start_recon_wizard(update, uid):
+    wizard = _new_wizard(uid, "recon", update.effective_chat.id)
+    keyboard = _wizard_keyboard(wizard, [
+        ("\u26a1 Quick", "type", "quick"),
+        ("\U0001f50e Normal", "type", "normal"),
+        ("\U0001f9e0 Full", "type", "full"),
+    ])
+    await update.message.reply_text("\U0001f50d *Recon* \u2014 \u00bfTipo de escaneo?", parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def _handle_recon_type(query, uid, wizard, subtype):
+    if subtype not in {"quick", "normal", "full"}:
+        await query.edit_message_text("Tipo de escaneo no permitido.")
         return
-    target = " ".join(context.args)
-    if not target:
-        await update.message.reply_text("Uso: /osint <dominio|email>")
+    updates = dict(
+        step="awaiting_target",
+        scan_type=subtype,
+        target=None,
+    )
+    await query.edit_message_text("Introduce la IP, dominio o rango:")
+    wizard.update(updates)
+
+
+# ─── Web Wizard ───
+
+
+_EXPLICIT_SCHEME_RE = re.compile(
+    r"^([A-Za-z][A-Za-z0-9+.-]*):(?![0-9]+(?:[/?#]|$))"
+)
+
+
+def _normalize_web_input(value: str) -> tuple[str | None, str | None, str | None]:
+    raw = value.strip()
+    if not raw:
+        return None, None, "La URL no puede estar vacia."
+    if len(raw) > 2048:
+        return None, None, "La URL supera el limite de 2048 caracteres."
+    if "\\" in raw:
+        return None, None, "La URL no puede contener barras invertidas."
+    if any(
+        char.isspace() or ord(char) < 32 or 0x7F <= ord(char) <= 0x9F
+        for char in raw
+    ):
+        return None, None, "La URL no puede contener espacios o controles."
+
+    scheme_match = _EXPLICIT_SCHEME_RE.match(raw)
+    if scheme_match:
+        supplied_scheme = scheme_match.group(1).lower()
+        if supplied_scheme not in ("http", "https"):
+            return None, None, "Solo se permiten URLs HTTP o HTTPS."
+    else:
+        raw = "https://" + raw
+
+    try:
+        parsed = urlparse(raw)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError:
+        return None, None, "La URL esta malformada."
+
+    if scheme not in ("http", "https") or not hostname:
+        return None, None, "La URL debe incluir un hostname valido."
+    if parsed.username is not None or parsed.password is not None:
+        return None, None, "La URL no puede incluir credenciales."
+
+    normalized = parsed._replace(scheme=scheme).geturl()
+    from tools_engine import validate_target, validate_url_target
+
+    error = validate_url_target(normalized)
+    if error:
+        return None, None, error
+    error = validate_target(hostname)
+    if error:
+        return None, None, error
+    return normalized, hostname, None
+
+
+async def _start_web_wizard(update, uid):
+    wizard = _new_wizard(uid, "web", update.effective_chat.id)
+    keyboard = _wizard_keyboard(wizard, [
+        ("\U0001f50e Reconocimiento Web", "type", "recon"),
+        ("\U0001f6e1\ufe0f Auditoría de Vulnerabilidades", "type", "vuln"),
+    ])
+    await update.message.reply_text("\U0001f310 *Web* \u2014 \u00bfTipo de auditor\u00eda?", parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def _handle_web_type(query, uid, wizard, subtype):
+    if subtype not in {"recon", "vuln"}:
+        await query.edit_message_text("Tipo de auditoria no permitido.")
         return
-    user_wizards[uid] = {"type": "osint", "target": target, "step": "awaiting_depth"}
-    await update.message.reply_text("Selecciona profundidad:", reply_markup=_depth_keyboard())
+    updates = dict(
+        step="awaiting_target",
+        audit_type=subtype,
+        target=None,
+    )
+    await query.edit_message_text("Introduce una URL HTTP(S) del sitio web:")
+    wizard.update(updates)
+
+
+# ─── Crack Wizard ───
+
+
+SUPPORTED_HASH_ALGORITHMS = frozenset(
+    {"MD5", "SHA1", "SHA224", "SHA256", "SHA384", "SHA512"}
+)
+
+
+def _validate_hash_algorithm(value: str) -> tuple[str | None, str | None]:
+    candidates = hacking.crypto.hash_id(value.strip())
+    for candidate in candidates:
+        algorithm = candidate.get("type", "")
+        if algorithm in SUPPORTED_HASH_ALGORITHMS:
+            return algorithm, None
+    detected = ", ".join(
+        candidate.get("type", "desconocido") for candidate in candidates
+    )
+    return None, (
+        f"Algoritmo no soportado: {detected}. "
+        "Usa MD5 o SHA1/224/256/384/512."
+    )
+
+
+async def _start_crack_wizard(update, uid):
+    wizard = _new_wizard(uid, "crack", update.effective_chat.id)
+    keyboard = _wizard_keyboard(wizard, [
+        ("\U0001f511 Hash", "type", "hash"),
+    ])
+    await update.message.reply_text("\U0001f511 *Crack* \u2014 \u00bfTipo?", parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def _handle_crack_type(query, uid, wizard, subtype):
+    if subtype != "hash":
+        await query.edit_message_text("Tipo de crack no permitido.")
+        return
+    if (
+        user_wizards.get(uid) is not wizard
+        or wizard.get("type") != "crack"
+        or wizard.get("step") != "select_type"
+    ):
+        await query.edit_message_text("Este wizard expiro. Vuelve al menu.")
+        return
+    updates = dict(
+        step="awaiting_value",
+        crack_type="hash",
+        target=None,
+    )
+    await query.edit_message_text("Pega el hash:")
+    wizard.update(updates)
+
+
+async def _handle_crack_value(query, uid, value):
+    wizard = user_wizards.get(uid)
+    if (
+        not wizard
+        or wizard.get("type") != "crack"
+        or wizard.get("step") != "awaiting_value"
+        or wizard.get("crack_type") != "hash"
+    ):
+        await query.edit_message_text("Metodo de crack no permitido.")
+        return
+    algorithm, error = _validate_hash_algorithm(value)
+    if error:
+        await _safe_edit_message(query, error)
+        return
+    updates = dict(
+        target=value.strip(),
+        algorithm=algorithm,
+        step="select_dict",
+    )
+    keyboard = _wizard_keyboard(wizard, [
+        ("\U0001f4da Integrado", "method", "integrated"),
+        ("\U0001f3b2 Custom", "method", "custom"),
+    ])
+    await query.edit_message_text("\U0001f511 \u00bfDiccionario?", reply_markup=keyboard)
+    wizard.update(updates)
+
+
+async def _execute_crack(
+    query,
+    uid,
+    wizard,
+    method,
+    wordlist=None,
+    consumed_wizard=None,
+):
+    if wizard.get("crack_type") != "hash" or method not in (
+        "integrated",
+        "custom",
+    ):
+        await query.edit_message_text("Metodo de crack no permitido.")
+        return
+    algorithm, error = _validate_hash_algorithm(wizard.get("target", ""))
+    if error:
+        await _safe_edit_message(query, error)
+        return
+    consumed = consumed_wizard or _consume_wizard(
+        uid, wizard.get("session_id", "")
+    )
+    if not consumed:
+        await _send_expired_callback(query)
+        return
+
+    hash_value = consumed["target"]
+    await _safe_edit_message(query, "\u23f3 Analizando hash...")
+    try:
+        if wordlist is None:
+            result = hacking.crypto.hash_crack(hash_value)
+        else:
+            result = hacking.crypto.hash_crack(hash_value, wordlist)
+    except Exception as exc:
+        log.exception("Crack wizard failed")
+        audit_log.log(
+            uid,
+            str(uid),
+            "wizard:crack",
+            hash_value,
+            "error",
+            str(exc),
+        )
+        await _safe_edit_message(
+            query,
+            "No se pudo completar Crack. Abre un nuevo wizard desde el menu.",
+        )
+        await _safe_reply_text(
+            query.message,
+            "Menú principal:",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+    status = "ok" if result.get("cracked") else "fail"
+    audit_log.log(
+        uid, str(uid), "wizard:crack", hash_value, status, method
+    )
+    message = _format_crack(result, method)
+    await _safe_edit_message(query, message, parse_mode="Markdown")
+    await _safe_reply_text(
+        query.message,
+        "Menú principal:",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+# ─── Payload Wizard ───
+
+
+def _parse_payload_endpoint(
+    value: str,
+) -> tuple[str | None, int | None, str | None]:
+    raw = value
+    if raw.startswith("["):
+        match = re.fullmatch(r"\[([^\[\]\s]+)\]:([0-9]+)", raw)
+        if not match:
+            return None, None, "Endpoint inválido. Usa [IPv6]:Puerto."
+        host, port_text = match.groups()
+        expected_version = 6
+    else:
+        match = re.fullmatch(r"([^:\s]+):([0-9]+)", raw)
+        if not match:
+            return None, None, "Endpoint inválido. Usa IP:Puerto."
+        host, port_text = match.groups()
+        expected_version = 4
+
+    try:
+        address = ipaddress.ip_address(host)
+        port = int(port_text)
+    except ValueError:
+        return None, None, "Endpoint inválido. Usa una IP y puerto válidos."
+
+    if address.version != expected_version:
+        form = "[IPv6]:Puerto" if expected_version == 6 else "IPv4:Puerto"
+        return None, None, f"Endpoint inválido. Usa {form}."
+    if not 1 <= port <= 65535:
+        return None, None, "Endpoint inválido. El puerto debe ser 1-65535."
+    if address.is_unspecified or address.is_multicast:
+        return None, None, "Endpoint inválido. La IP no puede ser multicast ni no especificada."
+    return str(address), port, None
+
+
+async def _start_payload_wizard(update, uid):
+    wizard = _new_wizard(uid, "payload", update.effective_chat.id)
+    keyboard = _wizard_keyboard(wizard, [
+        ("\U0001f41a Reverse Shell", "type", "reverse"),
+        ("\U0001f4bb Webshell", "type", "webshell"),
+    ])
+    await update.message.reply_text("\U0001f4a3 *Payload* \u2014 \u00bfTipo?", parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def _handle_payload_type(query, uid, wizard, subtype):
+    if subtype not in {"reverse", "webshell"}:
+        await query.edit_message_text("Tipo de payload no permitido.")
+        return
+    if subtype == "webshell":
+        options = [
+            ("\U0001f7e8 PHP", "lang", "php"),
+        ]
+    else:
+        options = [
+            ("\U0001f539 Bash", "lang", "bash"),
+        ]
+    keyboard = _wizard_keyboard(wizard, options)
+    await query.edit_message_text("\U0001f4a3 \u00bfLenguaje?", reply_markup=keyboard)
+    wizard.update(step="select_lang", payload_type=subtype)
+
+
+async def _handle_payload_lang(
+    query, uid, wizard, lang, consumed_wizard=None
+):
+    active_wizard = user_wizards.get(uid)
+    if consumed_wizard is None:
+        valid_session = active_wizard is wizard
+    else:
+        valid_session = consumed_wizard is wizard
+    if (
+        not valid_session
+        or wizard.get("type") != "payload"
+        or wizard.get("step") != "select_lang"
+    ):
+        await query.edit_message_text("\u23f0 Este wizard expir\u00f3. Vuelve al men\u00fa.")
+        return
+
+    payload_type = wizard.get("payload_type")
+    if payload_type == "webshell":
+        consumed = consumed_wizard or _consume_wizard(
+            uid, wizard.get("session_id", "")
+        )
+        if not consumed:
+            await _send_expired_callback(query)
+            return
+        try:
+            result = hacking.payloads.webshell(lang)
+        except Exception as exc:
+            log.exception("Webshell wizard failed")
+            audit_log.log(
+                uid,
+                str(uid),
+                "wizard:payload",
+                lang,
+                "error",
+                str(exc),
+            )
+            await _safe_edit_message(
+                query,
+                "No se pudo generar el payload. Abre un nuevo wizard desde el menu.",
+            )
+            await _safe_reply_text(
+                query.message,
+                "Menú principal:",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+        status = "error" if result.get("error") else "ok"
+        audit_log.log(
+            uid,
+            str(uid),
+            "wizard:payload",
+            lang,
+            status,
+            "webshell",
+        )
+        message = _format_webshell(result)
+        await _safe_edit_message(query, message, parse_mode="Markdown")
+        await _safe_reply_text(
+            query.message,
+            "Menú principal:",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+    if payload_type != "reverse":
+        await query.edit_message_text("Tipo de payload no permitido.")
+        return
+
+    await query.edit_message_text(
+        "Introduce tu listener como IP:Puerto (IPv6: [IP]:Puerto):"
+    )
+    wizard.update(lang=lang, step="awaiting_endpoint")
+
+
+# ─── Red Wizard ───
+
+
+async def _start_red_wizard(update, uid):
+    wizard = _new_wizard(uid, "red", update.effective_chat.id)
+    keyboard = _wizard_keyboard(wizard, [
+        ("\u26a1 Quick", "type", "quick"),
+        ("\U0001f50e Normal", "type", "normal"),
+        ("\U0001f9e0 Full", "type", "full"),
+    ])
+    await update.message.reply_text(
+        "\U0001f4e1 *RED* — ¿Perfil Nmap?",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+
+
+async def _handle_red_type(query, uid, wizard, subtype):
+    if subtype not in {"quick", "normal", "full"}:
+        await query.edit_message_text("Tipo de RED no permitido.")
+        return
+    updates = dict(
+        step="awaiting_target",
+        scan_type=subtype,
+        target=None,
+    )
+    await query.edit_message_text(
+        "Introduce una IP, dominio o rango autorizado:"
+    )
+    wizard.update(updates)
+
+
+# ─── OSINT Wizard ───
+
+
+async def _start_osint_wizard(update, uid):
+    wizard = _new_wizard(uid, "osint", update.effective_chat.id)
+    keyboard = _wizard_keyboard(wizard, [
+        ("\U0001f4e7 Email", "type", "email"),
+        ("\U0001f310 Dominio", "type", "domain"),
+    ])
+    await update.message.reply_text("\U0001f50e *OSINT* \u2014 \u00bfTipo?", parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def _handle_osint_type(query, uid, wizard, subtype):
+    prompts = {
+        "email": "Introduce el email:",
+        "domain": "Introduce el dominio:",
+    }
+    if subtype not in prompts:
+        await query.edit_message_text("Tipo de OSINT no permitido.")
+        return
+    updates = dict(
+        step="awaiting_target",
+        osint_type=subtype,
+        target=None,
+    )
+    await query.edit_message_text(prompts[subtype])
+    wizard.update(updates)
+
+
+def _validate_osint_email(value: str) -> str | None:
+    if not re.fullmatch(
+        r"[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+", value
+    ):
+        return "Email inválido. Usa una dirección con dominio completo."
+    domain = value.rsplit("@", 1)[1]
+    try:
+        ipaddress.ip_address(domain)
+    except ValueError:
+        pass
+    else:
+        return "Email inválido. Debe usar un dominio, no una IP."
+    if tools_engine.validate_target(domain):
+        return "Email inválido. Usa una dirección con dominio válido."
+    return None
+
+
+def _validate_osint_domain(value: str) -> str | None:
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        try:
+            ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            pass
+        else:
+            return "Introduce un dominio, no un rango CIDR."
+    else:
+        return "Introduce un dominio, no una dirección IP."
+
+    private_suffixes = (
+        ".home",
+        ".home.arpa",
+        ".internal",
+        ".lan",
+        ".local",
+        ".localdomain",
+        ".localhost",
+    )
+    if value.casefold().endswith(private_suffixes):
+        return "El dominio privado no está permitido."
+    return tools_engine.validate_target(value)
+
+
+def _format_email_osint(result: dict, target: str) -> str:
+    if result.get("error"):
+        return f"\u274c {result['error']}"
+
+    lines = ["\U0001f50e OSINT Email", f"Email: {result.get('email', target)}"]
+    domain = result.get("domain")
+    if domain:
+        lines.append(f"Dominio: {domain}")
+
+    mx_records = result.get("mx_records") or []
+    if mx_records:
+        lines.append("MX:")
+        lines.extend(f"- {record}" for record in mx_records[:10])
+    else:
+        lines.append("MX: sin registros reportados")
+
+    domain_info = result.get("dominio_info") or {}
+    total_certs = domain_info.get("total_certs")
+    if total_certs is not None:
+        lines.append(f"Certificados reportados: {total_certs}")
+    cert_domains = domain_info.get("subdominios_cert") or []
+    if cert_domains:
+        lines.append("Dominios en certificados:")
+        lines.extend(f"- {domain}" for domain in cert_domains[:20])
+
+    warnings = result.get("warnings") or []
+    if warnings:
+        for w in warnings:
+            lines.append(f"\u26a0\ufe0f {w}")
+
+    status = result.get("status", "ok")
+    if status == "error":
+        lines.append("\u274c OSINT fall\u00f3: todas las fuentes reportaron error")
+    elif status == "partial":
+        lines.append("\u26a0\ufe0f Resultado parcial: algunas fuentes no respondieron")
+
+    return "\n".join(lines)
 
 
 # ─── Text Message Handler ───
@@ -404,79 +1277,659 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
 
-    if uid in user_wizards:
-        wizard = user_wizards[uid]
-        if wizard["step"] == "awaiting_target":
-            if wizard["type"] == "objetivo":
-                target_engine.set_target(uid, text, "domain")
-                user_wizards.pop(uid, None)
-                await update.message.reply_text(f"\u2705 Objetivo establecido: `{text}`", parse_mode="Markdown")
-                return
-            wizard["target"] = text
-            wizard["step"] = "awaiting_depth"
-            await update.message.reply_text("Selecciona profundidad:", reply_markup=_depth_keyboard())
-            return
-        elif wizard["step"] == "awaiting_value":
-            await _execute_immediate(update, wizard, text)
-            return
+    if uid in user_wizards and _is_wizard_expired(uid):
+        await update.message.reply_text(
+            "Este wizard expiro. Abre uno nuevo desde el menu."
+        )
+        return
+
+    wizard = user_wizards.get(uid)
+    if wizard and wizard.get("chat_id") != update.effective_chat.id:
+        await update.message.reply_text(
+            "Este wizard pertenece a otro chat. Continua en el chat original."
+        )
+        return
 
     menu = {
-        "\U0001f50d Recon": lambda: _start_wizard(update, uid, "recon", _recon_keyboard(), "Selecciona tipo de reconocimiento:"),
-        "\U0001f310 Web": lambda: _start_wizard(update, uid, "web", None, "Introduce la URL del sitio web a auditar:"),
-        "\U0001f511 Crack": lambda: _start_wizard(update, uid, "crack", None, "Introduce el hash a crackear:"),
-        "\U0001f4a3 Payloads": lambda: _start_wizard(update, uid, "payload", None, "Introduce IP:puerto (ej: 10.0.0.1:4444):"),
-        "\U0001f4e1 Red": lambda: _start_wizard(update, uid, "red", None, "Introduce IP o rango de red:"),
-        "\U0001f50e OSINT": lambda: _start_wizard(update, uid, "osint", None, "Introduce dominio o email para OSINT:"),
+        "\U0001f50d Recon": lambda: _start_recon_wizard(update, uid),
+        "\U0001f310 Web": lambda: _start_web_wizard(update, uid),
+        "\U0001f511 Crack": lambda: _start_crack_wizard(update, uid),
+        "\U0001f4a3 Payloads": lambda: _start_payload_wizard(update, uid),
+        "\U0001f4e1 Red": lambda: _start_red_wizard(update, uid),
+        "\U0001f50e OSINT": lambda: _start_osint_wizard(update, uid),
         "\U0001f4cb Mis Tareas": lambda: tareas(update, context),
         "\u2753 Ayuda": lambda: ayuda(update, context),
         "\u2699\ufe0f Objetivo": lambda: _objetivo_wizard(update, uid),
     }
-
     handler = menu.get(text)
     if handler:
+        user_wizards.pop(uid, None)
         await handler()
-    else:
-        await _chat_api(update, text)
+        return
 
+    if uid in user_wizards:
+        wizard = user_wizards[uid]
+        wtype = wizard["type"]
+        step = wizard["step"]
 
-async def _start_wizard(update, uid, wtype, keyboard, prompt):
-    if wtype in ("crack", "payload"):
-        user_wizards[uid] = {"type": wtype, "step": "awaiting_value", "target": None}
-    else:
-        user_wizards[uid] = {"type": wtype, "step": "awaiting_target", "target": None}
-    await update.message.reply_text(prompt, reply_markup=keyboard)
+        if step == "awaiting_target":
+            if wtype == "objetivo":
+                state = dict(wizard)
+                consumed = _consume_wizard(
+                    uid, state.get("session_id", "")
+                )
+                if not consumed:
+                    await update.message.reply_text(
+                        "Este wizard expiro. Vuelve al menu."
+                    )
+                    return
+                try:
+                    target_engine.set_target(uid, text, "domain")
+                except Exception as exc:
+                    log.exception("Objetivo wizard failed")
+                    audit_log.log(
+                        uid,
+                        _username(update),
+                        "wizard:objetivo",
+                        text,
+                        "error",
+                        str(exc),
+                    )
+                    await _safe_reply_text(
+                        update.message,
+                        "No se pudo guardar el objetivo. Abre un nuevo wizard desde el menu.",
+                    )
+                    return
+                audit_log.log(
+                    uid,
+                    _username(update),
+                    "wizard:objetivo",
+                    text,
+                    "ok",
+                    "",
+                )
+                await _safe_reply_text(
+                    update.message,
+                    f"\u2705 Objetivo establecido: `{text}`",
+                    parse_mode="Markdown",
+                )
+                return
+
+            elif wtype == "red":
+                error = tools_engine.validate_target(text)
+                if error:
+                    await _safe_reply_text(
+                        update.message, f"\u274c {error}"
+                    )
+                    return
+
+                if "/" in text:
+                    target_type = "network"
+                else:
+                    try:
+                        ipaddress.ip_address(text)
+                    except ValueError:
+                        target_type = "domain"
+                    else:
+                        target_type = "ip"
+
+                consumed = _consume_wizard(
+                    uid, wizard.get("session_id", "")
+                )
+                if not consumed:
+                    await update.message.reply_text(
+                        "Este wizard expiro. Vuelve al menu."
+                    )
+                    return
+
+                scan_type = consumed.get("scan_type", "normal")
+                try:
+                    target_engine.set_target(uid, text, target_type)
+                    task_id = task_queue.submit(
+                        "nmap",
+                        text,
+                        {"scan_type": scan_type, "user_id": uid},
+                    )
+                    if not task_id:
+                        raise RuntimeError(
+                            "Task queue returned no task ID"
+                        )
+                except Exception as exc:
+                    log.exception("Red wizard failed")
+                    audit_log.log(
+                        uid,
+                        _username(update),
+                        "wizard:red",
+                        text,
+                        "error",
+                        str(exc),
+                    )
+                    await _safe_reply_text(
+                        update.message,
+                        "No se pudo iniciar Red. Abre un nuevo wizard desde el menu.",
+                    )
+                    await _safe_reply_text(
+                        update.message,
+                        "Menú principal:",
+                        reply_markup=MAIN_KEYBOARD,
+                    )
+                    return
+
+                audit_log.log(
+                    uid,
+                    _username(update),
+                    "wizard:red",
+                    text,
+                    "ok",
+                    f"task:{task_id} scan_type:{scan_type}",
+                )
+                msg = await _safe_reply_text(
+                    update.message,
+                    f"\u2705 `{task_id}` — Escaneando {text} ({scan_type})",
+                    parse_mode="Markdown",
+                )
+                asyncio.create_task(
+                    _poll_nmap_task(
+                        msg, task_id, return_to_menu=True
+                    )
+                )
+                return
+
+            target_type = wizard.get("target_type", "domain")
+            if wtype == "web":
+                normalized, hostname, error = _normalize_web_input(text)
+                if error:
+                    await _safe_reply_text(
+                        update.message,
+                        f"Error: {error}\n"
+                        "Introduce una URL HTTP(S) e intenta de nuevo."
+                    )
+                    return
+
+                operations = {
+                    "recon": (
+                        "recon_web",
+                        normalized,
+                        "normal",
+                        "Reconocimiento Web",
+                    ),
+                    "vuln": (
+                        "web_audit",
+                        normalized,
+                        "profundo",
+                        "Auditoría de Vulnerabilidades",
+                    ),
+                }
+                operation = operations.get(wizard.get("audit_type"))
+                if not operation:
+                    await _safe_reply_text(
+                        update.message,
+                        "Tipo de auditoria Web no permitido.",
+                    )
+                    return
+
+                playbook, playbook_target, depth, label = operation
+                state = dict(wizard)
+                consumed = _consume_wizard(
+                    uid, state.get("session_id", "")
+                )
+                if not consumed:
+                    await _safe_reply_text(
+                        update.message,
+                        "Este wizard expiro. Vuelve al menu.",
+                    )
+                    return
+
+                try:
+                    target_engine.set_target(uid, normalized, "url")
+                    task_id = task_queue.submit(
+                        "playbook",
+                        playbook_target,
+                        {"playbook": playbook, "depth": depth, "user_id": uid},
+                    )
+                    if not task_id:
+                        raise RuntimeError(
+                            "Task queue returned no task ID"
+                        )
+                except Exception as exc:
+                    log.exception("Web wizard failed")
+                    audit_log.log(
+                        uid,
+                        _username(update),
+                        "wizard:web",
+                        normalized,
+                        "error",
+                        str(exc),
+                    )
+                    await _safe_reply_text(
+                        update.message,
+                        "No se pudo iniciar Web. Abre un nuevo wizard desde el menu.",
+                    )
+                    return
+
+                audit_log.log(
+                    uid,
+                    _username(update),
+                    "wizard:web",
+                    normalized,
+                    "ok",
+                    f"task:{task_id} playbook:{playbook} depth:{depth}",
+                )
+                msg = await _safe_reply_text(
+                    update.message,
+                    f"Web iniciado: `{task_id}`\n{label}\n{normalized}",
+                    parse_mode="Markdown",
+                )
+                asyncio.create_task(
+                    _poll_playbook_task(
+                        msg,
+                        task_id,
+                        label,
+                        return_to_menu=True,
+                    )
+                )
+                return
+            elif wtype == "recon":
+                error = tools_engine.validate_target(text)
+                if error:
+                    await _safe_reply_text(
+                        update.message, f"\u274c {error}"
+                    )
+                    return
+
+                state = dict(wizard)
+                consumed = _consume_wizard(
+                    uid, state.get("session_id", "")
+                )
+                if not consumed:
+                    await _safe_reply_text(
+                        update.message,
+                        "Este wizard expiro. Vuelve al menu.",
+                    )
+                    return
+
+                target = text
+                scan_type = consumed.get("scan_type", "normal")
+                if "/" in target:
+                    target_type = "network"
+                else:
+                    try:
+                        ipaddress.ip_address(target)
+                    except ValueError:
+                        target_type = "domain"
+                    else:
+                        target_type = "ip"
+
+                try:
+                    target_engine.set_target(uid, target, target_type)
+                    task_id = task_queue.submit(
+                        "nmap",
+                        target,
+                        {"scan_type": scan_type, "user_id": uid},
+                    )
+                    if not task_id:
+                        raise RuntimeError("Task queue returned no task ID")
+                except Exception as exc:
+                    log.exception("Recon wizard failed")
+                    audit_log.log(
+                        uid,
+                        _username(update),
+                        "wizard:recon",
+                        target,
+                        "error",
+                        str(exc),
+                    )
+                    await _safe_reply_text(
+                        update.message,
+                        "No se pudo iniciar Recon. Abre un nuevo wizard desde el menu.",
+                    )
+                    return
+
+                audit_log.log(
+                    uid,
+                    _username(update),
+                    "wizard:recon",
+                    target,
+                    "ok",
+                    f"task:{task_id} scan_type:{scan_type}",
+                )
+                msg = await _safe_reply_text(
+                    update.message,
+                    f"\u2705 `{task_id}` \u2014 Escaneando {target} ({scan_type})",
+                    parse_mode="Markdown",
+                )
+                asyncio.create_task(
+                    _poll_nmap_task(msg, task_id, return_to_menu=True)
+                )
+            elif wtype == "osint":
+                osint_type = wizard.get("osint_type")
+                if osint_type == "email":
+                    error = _validate_osint_email(text)
+                    if error:
+                        await _safe_reply_text(
+                            update.message, f"\u274c {error}"
+                        )
+                        return
+
+                    consumed = _consume_wizard(
+                        uid, wizard.get("session_id", "")
+                    )
+                    if not consumed:
+                        await update.message.reply_text(
+                            "Este wizard expiro. Vuelve al menu."
+                        )
+                        return
+
+                    status_message = await _safe_reply_text(
+                        update.message,
+                        f"\U0001f50e Consultando OSINT para {text}...",
+                    )
+                    try:
+                        target_engine.set_target(uid, text, "email")
+                        result = await asyncio.to_thread(
+                            hacking.osint.email_osint, text
+                        )
+                    except Exception as exc:
+                        log.exception("OSINT email wizard failed")
+                        audit_log.log(
+                            uid,
+                            _username(update),
+                            "wizard:osint:email",
+                            text,
+                            "error",
+                            str(exc),
+                        )
+                        await _safe_edit_text(
+                            status_message,
+                            "No se pudo completar OSINT. Abre un nuevo wizard desde el menu.",
+                        )
+                        await _safe_reply_text(
+                            update.message,
+                            "Menú principal:",
+                            reply_markup=MAIN_KEYBOARD,
+                        )
+                        return
+
+                    result_status = result.get("status", "error" if result.get("error") else "ok")
+                    audit_log.log(
+                        uid,
+                        _username(update),
+                        "wizard:osint:email",
+                        text,
+                        result_status,
+                        "email_osint",
+                    )
+                    await _safe_edit_text(
+                        status_message,
+                        _format_email_osint(result, text),
+                    )
+                    await _safe_reply_text(
+                        update.message,
+                        "Menú principal:",
+                        reply_markup=MAIN_KEYBOARD,
+                    )
+                    return
+
+                if osint_type != "domain":
+                    await update.message.reply_text(
+                        "Tipo de OSINT no permitido."
+                    )
+                    return
+
+                error = _validate_osint_domain(text)
+                if error:
+                    await _safe_reply_text(
+                        update.message, f"\u274c {error}"
+                    )
+                    return
+
+                consumed = _consume_wizard(
+                    uid, wizard.get("session_id", "")
+                )
+                if not consumed:
+                    await update.message.reply_text(
+                        "Este wizard expiro. Vuelve al menu."
+                    )
+                    return
+
+                try:
+                    target_engine.set_target(uid, text, "domain")
+                    task_id = task_queue.submit(
+                        "playbook",
+                        text,
+                        {
+                            "playbook": "osint_domain",
+                            "depth": "normal",
+                            "user_id": uid,
+                        },
+                    )
+                    if not task_id:
+                        raise RuntimeError(
+                            "Task queue returned no task ID"
+                        )
+                except Exception as exc:
+                    log.exception("OSINT domain wizard failed")
+                    audit_log.log(
+                        uid,
+                        _username(update),
+                        "wizard:osint",
+                        text,
+                        "error",
+                        str(exc),
+                    )
+                    await _safe_reply_text(
+                        update.message,
+                        "No se pudo iniciar OSINT. Abre un nuevo wizard desde el menu.",
+                    )
+                    await _safe_reply_text(
+                        update.message,
+                        "Menú principal:",
+                        reply_markup=MAIN_KEYBOARD,
+                    )
+                    return
+
+                msg = await _safe_reply_text(
+                    update.message,
+                    f"\u2705 *OSINT* — `{task_id}`\n{text}",
+                    parse_mode="Markdown",
+                )
+                asyncio.create_task(
+                    _poll_playbook_task(
+                        msg,
+                        task_id,
+                        "OSINT de Dominio",
+                        return_to_menu=True,
+                        uid=uid,
+                    )
+                )
+            return
+
+        elif step == "awaiting_value":
+            if wtype == "crack":
+                if wizard.get("crack_type") != "hash":
+                    await update.message.reply_text(
+                        "Tipo de crack no permitido."
+                    )
+                    return
+                algorithm, error = _validate_hash_algorithm(text)
+                if error:
+                    await _safe_reply_text(update.message, error)
+                    return
+                wizard.update(
+                    target=text,
+                    algorithm=algorithm,
+                    step="select_dict",
+                )
+                keyboard = _wizard_keyboard(wizard, [
+                    ("\U0001f4da Integrado", "method", "integrated"),
+                    ("\U0001f3b2 Custom", "method", "custom"),
+                ])
+                await update.message.reply_text("\U0001f511 \u00bfDiccionario?", reply_markup=keyboard)
+                return
+
+        elif step == "awaiting_dictionary" and wtype == "crack":
+            if wizard.get("crack_type") != "hash":
+                await update.message.reply_text(
+                    "Metodo de crack no permitido."
+                )
+                return
+            words = [
+                word.strip()
+                for word in text.replace("\n", ",").split(",")
+                if word.strip()
+            ]
+            if not words:
+                await update.message.reply_text("\u274c Introduce al menos una palabra.")
+                return
+            algorithm, error = _validate_hash_algorithm(
+                wizard.get("target", "")
+            )
+            if error:
+                await _safe_reply_text(update.message, error)
+                return
+            state = dict(wizard)
+            consumed = _consume_wizard(
+                uid, state.get("session_id", "")
+            )
+            if not consumed:
+                await update.message.reply_text(
+                    "Este wizard expiro. Vuelve al menu."
+                )
+                return
+
+            hash_value = consumed["target"]
+            await _safe_reply_text(
+                update.message, "\u23f3 Analizando hash..."
+            )
+            try:
+                result = hacking.crypto.hash_crack(hash_value, words)
+            except Exception as exc:
+                log.exception("Custom Crack wizard failed")
+                audit_log.log(
+                    uid,
+                    _username(update),
+                    "wizard:crack",
+                    hash_value,
+                    "error",
+                    str(exc),
+                )
+                await _safe_reply_text(
+                    update.message,
+                    "No se pudo completar Crack. Abre un nuevo wizard desde el menu.",
+                )
+                await _safe_reply_text(
+                    update.message,
+                    "Menú principal:",
+                    reply_markup=MAIN_KEYBOARD,
+                )
+                return
+            status = "ok" if result.get("cracked") else "fail"
+            audit_log.log(
+                uid,
+                _username(update),
+                "wizard:crack",
+                hash_value,
+                status,
+                "custom",
+            )
+            message = _format_crack(result, "custom")
+            await _safe_reply_text(
+                update.message, message, parse_mode="Markdown"
+            )
+            await _safe_reply_text(
+                update.message,
+                "Menú principal:",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+
+        elif step == "awaiting_endpoint" and wtype == "payload":
+            ip, port, error = _parse_payload_endpoint(
+                update.message.text
+            )
+            if error:
+                await update.message.reply_text(f"\u274c {error}")
+                return
+
+            if (
+                wizard.get("payload_type") != "reverse"
+                or wizard.get("lang") != "bash"
+            ):
+                await update.message.reply_text(
+                    "Tipo de payload no permitido."
+                )
+                return
+
+            consumed = _consume_wizard(
+                uid, wizard.get("session_id", "")
+            )
+            if not consumed:
+                await update.message.reply_text(
+                    "Este wizard expiro. Vuelve al menu."
+                )
+                return
+            lang = consumed["lang"]
+            audit_target = (
+                f"[{ip}]:{port}" if ":" in ip else f"{ip}:{port}"
+            )
+            try:
+                result = hacking.payloads.reverse_shell(
+                    ip, port, lang
+                )
+            except Exception as exc:
+                log.exception("Payload wizard failed")
+                audit_log.log(
+                    uid,
+                    _username(update),
+                    "wizard:payload",
+                    audit_target,
+                    "error",
+                    str(exc),
+                )
+                await _safe_reply_text(
+                    update.message,
+                    "No se pudo generar el payload. Abre un nuevo wizard desde el menu.",
+                )
+                await _safe_reply_text(
+                    update.message,
+                    "Menú principal:",
+                    reply_markup=MAIN_KEYBOARD,
+                )
+                return
+            status = "error" if result.get("error") else "ok"
+            audit_log.log(
+                uid,
+                _username(update),
+                "wizard:payload",
+                audit_target,
+                status,
+                lang,
+            )
+            msg = _format_payload(result)
+            await _safe_reply_text(
+                update.message, msg, parse_mode="Markdown"
+            )
+            await _safe_reply_text(
+                update.message,
+                "Menú principal:",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+
+    await _chat_api(update, text)
 
 
 async def _objetivo_wizard(update, uid):
-    user_wizards[uid] = {"type": "objetivo", "step": "awaiting_target", "target": None}
+    _new_wizard(
+        uid,
+        "objetivo",
+        update.effective_chat.id,
+        step="awaiting_target",
+    )
     await update.message.reply_text("Introduce el target (IP, dominio o rango):")
 
 
-async def _execute_immediate(update, wizard, value):
-    uid = update.effective_user.id
-    wtype = wizard["type"]
-    try:
-        if wtype == "crack":
-            result = hacking.crypto.hash_crack(value)
-            msg = _format_crack(result)
-        elif wtype == "payload":
-            parts = value.split(":")
-            if len(parts) != 2:
-                await update.message.reply_text("\u274c Formato: ip:puerto (ej: 10.0.0.1:4444)")
-                return
-            ip, port = parts[0], parts[1]
-            result = hacking.payloads.reverse_shell(ip, int(port))
-            msg = _format_payload(result)
-        else:
-            msg = "\u274c Comando no reconocido."
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    except Exception as e:
-        await update.message.reply_text(f"\u274c Error: {str(e)}")
-    finally:
-        user_wizards.pop(uid, None)
-
-
-def _format_crack(result: dict) -> str:
+def _format_crack(result: dict, method: str = "integrated") -> str:
     lines = ["\U0001f511 *Hash Crack*"]
     lines.append(f"Hash: `{result['hash']}`")
     lines.append(f"Algoritmo: {result['algorithm']}")
@@ -486,18 +1939,37 @@ def _format_crack(result: dict) -> str:
     if result.get("cracked"):
         lines.append(f"\u2705 *Crackeado:* `{result['plaintext']}`")
     else:
-        lines.append("\u274c No se pudo crackear con el diccionario integrado.")
+        dictionary = "custom" if method == "custom" else "integrado"
+        lines.append(
+            f"\u274c No se pudo crackear con el diccionario {dictionary}."
+        )
     return "\n".join(lines)
 
 
 def _format_payload(result: dict) -> str:
     if "error" in result:
         return f"\u274c {result['error']}"
-    lines = ["\U0001f4a3 *Payload ({})*".format(result["type"])]
-    lines.append(f"```\n{result['payload']}\n```")
-    lines.append(f"\U0001f4e1 Listener: `{result['listener']}`")
-    lines.append(f"\U0001f510 Base64: `{result['encoded_b64']}`")
+    payload_type = result.get("type", "reverse")
+    payload = result.get("decoded", result.get("payload", ""))
+    encoded = result.get("encoded", result.get("encoded_b64", ""))
+    lines = ["\U0001f4a3 *Payload ({})*".format(payload_type)]
+    lines.append(f"```\n{payload}\n```")
+    if result.get("listener"):
+        lines.append(f"\U0001f4e1 Listener: `{result['listener']}`")
+    if encoded:
+        lines.append(f"\U0001f510 Base64: `{encoded}`")
     return "\n".join(lines)
+
+
+def _format_webshell(result: dict) -> str:
+    if "error" in result:
+        return f"\u274c {result['error']}"
+    language = result.get("language", "webshell")
+    return (
+        f"\U0001f4bb *Webshell ({language})*\n"
+        f"```\n{result.get('decoded', '')}\n```\n"
+        f"\U0001f510 Base64: `{result.get('encoded', '')}`"
+    )
 
 
 async def _show_playbooks(update):
@@ -510,7 +1982,9 @@ async def _show_playbooks(update):
         lines.append(f"\u2022 *{info['name']}* (`{name}`)")
         lines.append(f"  _{info['description']}_")
         lines.append(f"  Tipo: {info['target_type']} | Profundidad: {info['depth_estimate']}\n")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await _safe_reply_text(
+        update.message, "\n".join(lines), parse_mode="Markdown"
+    )
 
 
 async def _send_report(update, uid):
@@ -522,7 +1996,8 @@ async def _send_report(update, uid):
     try:
         report = generate_report(target, {}, fmt="md")
         content = report.get("content", "")[:3000]
-        await update.message.reply_text(
+        await _safe_reply_text(
+            update.message,
             f"\U0001f4c4 *Reporte generado:* `{report['filename']}`\n{content}",
             parse_mode="Markdown",
         )
@@ -543,10 +2018,13 @@ async def _system_status(update, uid):
     lines.append(f"\n\U0001f4cb Tareas activas: {len(active)}")
     for t in active:
         lines.append(f"  \u2022 `{t['id']}` \u2192 {t['target']} ({t['status']})")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await _safe_reply_text(
+        update.message, "\n".join(lines), parse_mode="Markdown"
+    )
 
 
 async def _chat_api(update, text):
+    delivery_kwargs = {}
     try:
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
@@ -555,16 +2033,22 @@ async def _chat_api(update, text):
                 headers={"Authorization": f"Bearer {AUTH_TOKEN}"},
             )
             if resp.status_code == 200:
-                data = resp.json()
-                msg = data.get("response", "Sin respuesta")
                 try:
-                    await update.message.reply_text(msg, parse_mode="Markdown")
-                except Exception:
-                    await update.message.reply_text(msg)
+                    data = resp.json()
+                    if not isinstance(data, dict):
+                        raise ValueError("response JSON is not an object")
+                except ValueError as exc:
+                    log.warning("Chat API returned invalid JSON: %s", exc)
+                    msg = "\u274c Respuesta invalida de la API."
+                else:
+                    msg = data.get("response", "Sin respuesta")
+                    delivery_kwargs["parse_mode"] = "Markdown"
             else:
-                await update.message.reply_text(f"\u274c Error de API: {resp.status_code}")
-    except Exception as e:
-        await update.message.reply_text(f"\u274c Error de conexi\u00f3n: {str(e)}")
+                msg = f"\u274c Error de API: {resp.status_code}"
+    except httpx.HTTPError as exc:
+        msg = f"\u274c Error de conexi\u00f3n: {str(exc)}"
+
+    await _safe_reply_text(update.message, msg, **delivery_kwargs)
 
 
 # ─── Callback Query Handler ───
@@ -572,73 +2056,96 @@ async def _chat_api(update, text):
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     uid = update.effective_user.id
-    if not _check_role(uid):
-        await query.edit_message_text("\u274c No autorizado")
-        return
-    rl = _rate_limit_msg(uid)
-    if rl:
-        await query.edit_message_text(rl)
-        return
-
-    data = query.data
-
-    if data == "menu:main":
-        user_wizards.pop(uid, None)
-        await query.edit_message_text("Men\u00fa principal:", reply_markup=MAIN_KEYBOARD)
-        return
-
-    if data == "action:cancel":
-        user_wizards.pop(uid, None)
-        await query.edit_message_text("\u274c Operaci\u00f3n cancelada.")
-        return
-
-    if data.startswith("wizard:"):
-        parts = data.split(":")
-        wtype = parts[1]
-        subtype = parts[2]
-        prompts = {"dominio": "Introduce el dominio para reconocimiento:",
-                   "ip": "Introduce la IP para reconocimiento:",
-                   "red": "Introduce el rango de red para reconocimiento:"}
-        user_wizards[uid] = {"type": wtype, "target_type": subtype, "step": "awaiting_target", "target": None}
-        await query.edit_message_text(prompts.get(subtype, "Introduce el objetivo:"))
-        return
-
-    if data.startswith("depth:"):
-        depth = data.split(":")[1]
-        wizard = user_wizards.get(uid)
-        if not wizard or wizard["step"] != "awaiting_depth" or not wizard.get("target"):
-            await query.edit_message_text("\u274c No hay wizard activo o falta el objetivo.")
-            return
-        await _execute_wizard(query, uid, wizard, depth)
-
-
-async def _execute_wizard(query, uid, wizard, depth):
-    wtype = wizard["type"]
-    target = wizard["target"]
-    target_type = wizard.get("target_type", "domain")
-
-    target_engine.set_target(uid, target, target_type)
-    target_engine.set_operation(uid, wtype)
-
-    pb_map = {"recon": "recon_web", "web": "web_audit", "red": "full_scan", "osint": "osint_domain"}
-    pb_name = pb_map.get(wtype, "recon_web")
-    task_id = task_queue.submit("playbook", target, {"playbook": pb_name, "depth": depth})
-    audit_log.log(uid, str(uid), f"wizard:{wtype}", target, "ok", f"task:{task_id} depth:{depth}")
-
-    user_wizards.pop(uid, None)
-
-    depth_names = {"rapido": "\u26a1 R\u00e1pido", "normal": "\U0001f50e Normal", "profundo": "\U0001f9e0 Profundo"}
-    msg = (
-        f"\u2705 *Wizard iniciado*\n\n"
-        f"\U0001f4cc Operaci\u00f3n: `{wtype}`\n"
-        f"\U0001f3af Objetivo: `{target}`\n"
-        f"\U0001f4ca Profundidad: {depth_names.get(depth, depth)}\n"
-        f"\U0001f4cb Tarea: `{task_id}`\n\n"
-        f"Usa /tarea `{task_id}` para ver el progreso."
+    chat_id = update.effective_chat.id
+    wizard, action, value, rejection = _validate_wizard_callback(
+        uid, chat_id, query.data
     )
-    await query.edit_message_text(msg, parse_mode="Markdown")
+    if rejection:
+        reason, message = rejection
+        await _reject_callback(query, reason, message, uid, chat_id)
+        return
+
+    if action == "back":
+        if not _consume_wizard(uid, wizard["session_id"]):
+            await _send_expired_callback(query)
+            return
+        await query.answer()
+        await _safe_edit_message(query, "Operaci\u00f3n cerrada.")
+        await _safe_reply_text(
+            query.message,
+            "Men\u00fa principal:",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+    if action == "cancel":
+        if not _consume_wizard(uid, wizard["session_id"]):
+            await _send_expired_callback(query)
+            return
+        await query.answer()
+        await _safe_edit_message(query, "\u274c Operaci\u00f3n cancelada.")
+        return
+
+    wizard_type = wizard["type"]
+    if action == "type":
+        await query.answer()
+        handlers = {
+            "recon": _handle_recon_type,
+            "web": _handle_web_type,
+            "crack": _handle_crack_type,
+            "payload": _handle_payload_type,
+            "red": _handle_red_type,
+            "osint": _handle_osint_type,
+        }
+        await handlers[wizard_type](query, uid, wizard, value)
+        return
+    if wizard_type == "crack" and action == "method":
+        if value == "custom":
+            await query.answer()
+            await query.edit_message_text(
+                "Introduce palabras separadas por comas:"
+            )
+            wizard.update(step="awaiting_dictionary")
+        else:
+            consumed = _consume_wizard(uid, wizard["session_id"])
+            if not consumed:
+                await _send_expired_callback(query)
+                return
+            await query.answer()
+            await _execute_crack(
+                query,
+                uid,
+                wizard,
+                value,
+                consumed_wizard=consumed,
+            )
+        return
+    if wizard_type == "payload" and action == "lang":
+        if wizard.get("payload_type") == "webshell":
+            consumed = _consume_wizard(uid, wizard["session_id"])
+            if not consumed:
+                await _send_expired_callback(query)
+                return
+            await query.answer()
+            await _handle_payload_lang(
+                query,
+                uid,
+                wizard,
+                value,
+                consumed_wizard=consumed,
+            )
+        else:
+            await query.answer()
+            await _handle_payload_lang(query, uid, wizard, value)
+        return
+
+    log.warning(
+        "Telegram callback rejected: reason=%s user=%s chat=%s data=%r",
+        "unroutable_callback",
+        uid,
+        chat_id,
+        query.data,
+    )
 
 
 # ─── Photo Handler ───
@@ -680,19 +2187,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── Voice Handler ───
 
 
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not _check_role(uid):
-        return
-    rl = _rate_limit_msg(uid)
-    if rl:
-        await update.message.reply_text(rl)
-        return
-
-    voice = update.message.voice
-    file = await voice.get_file()
-    ogg_bytes = await file.download_as_bytearray()
-
+def _process_voice_blocking(ogg_bytes: bytes, uid: int) -> str:
     audio_dir = Path("data/audio")
     audio_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.utcnow().timestamp()
@@ -729,10 +2224,79 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+    return text
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not _check_role(uid):
+        return
+    rl = _rate_limit_msg(uid)
+    if rl:
+        await update.message.reply_text(rl)
+        return
+
+    voice = update.message.voice
+    file = await voice.get_file()
+    ogg_bytes = await file.download_as_bytearray()
+
+    text = await asyncio.to_thread(_process_voice_blocking, ogg_bytes, uid)
+
     if text and not text.startswith("["):
-        await update.message.reply_text(f"\U0001f3a4 *Transcripci\u00f3n:*\n{text}", parse_mode="Markdown")
+        await _safe_reply_text(
+            update.message,
+            f"\U0001f3a4 *Transcripci\u00f3n:*\n{text}",
+            parse_mode="Markdown",
+        )
     else:
         await update.message.reply_text(text)
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not _check_role(uid):
+        return
+    rl = _rate_limit_msg(uid)
+    if rl:
+        await update.message.reply_text(rl)
+        return
+
+    await update.message.reply_text(
+        "El cracking de archivos no esta disponible. Usa el flujo Hash."
+    )
+
+
+async def _open_wizard_command(update, starter):
+    uid = update.effective_user.id
+    if not _check_role(uid):
+        await update.message.reply_text("No autorizado")
+        return
+    rate_limit_error = _rate_limit_msg(uid)
+    if rate_limit_error:
+        await update.message.reply_text(rate_limit_error)
+        return
+    user_wizards.pop(uid, None)
+    await starter(update, uid)
+
+
+async def recon_command(update, context):
+    await _open_wizard_command(update, _start_recon_wizard)
+
+
+async def web_command(update, context):
+    await _open_wizard_command(update, _start_web_wizard)
+
+
+async def crack_command(update, context):
+    await _open_wizard_command(update, _start_crack_wizard)
+
+
+async def payload_command(update, context):
+    await _open_wizard_command(update, _start_payload_wizard)
+
+
+async def osint_command(update, context):
+    await _open_wizard_command(update, _start_osint_wizard)
 
 
 # ─── Ayuda ───
@@ -782,15 +2346,18 @@ def main():
     application.add_handler(CommandHandler("tarea", tarea))
     application.add_handler(CommandHandler("tareas", tareas))
     application.add_handler(CommandHandler("nmap", nmap_shortcut))
-    application.add_handler(CommandHandler("recon", nmap_shortcut))
-    application.add_handler(CommandHandler("webscan", webscan_shortcut))
-    application.add_handler(CommandHandler("crack", crack_shortcut))
-    application.add_handler(CommandHandler("payload", payload_shortcut))
-    application.add_handler(CommandHandler("osint", osint_shortcut))
+    application.add_handler(CommandHandler("recon", recon_command))
+    application.add_handler(CommandHandler(["webscan", "web"], web_command))
+    application.add_handler(CommandHandler("crack", crack_command))
+    application.add_handler(CommandHandler("payload", payload_command))
+    application.add_handler(CommandHandler("osint", osint_command))
     application.add_handler(CommandHandler("ayuda", ayuda))
     application.add_handler(CommandHandler("help", ayuda))
 
     # Manejador global de texto e interacción de menús
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
@@ -802,4 +2369,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

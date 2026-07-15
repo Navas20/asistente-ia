@@ -111,6 +111,8 @@ def banner_grab(host: str, port: int, timeout: float = 3.0) -> str:
 def dns_enum(domain: str) -> dict:
     record_types = ["A", "AAAA", "MX", "NS", "TXT", "SOA", "CNAME"]
     result = {}
+    completed = []
+    failures = []
     try:
         import dns.resolver
     except ImportError:
@@ -119,34 +121,81 @@ def dns_enum(domain: str) -> dict:
         try:
             answers = dns.resolver.resolve(domain, rtype, lifetime=5)
             result[rtype] = [str(r) for r in answers]
+            completed.append(rtype)
         except dns.resolver.NoAnswer:
             result[rtype] = []
+            completed.append(rtype)
         except dns.resolver.NXDOMAIN:
             return {"error": f"Dominio {domain} no existe"}
         except Exception as e:
             log.debug(f"DNS {rtype} error: {e}")
             result[rtype] = []
+            failures.append((rtype, str(e).strip() or type(e).__name__))
+    if failures:
+        result["failed_record_types"] = [rtype for rtype, _ in failures]
+        result["completed_record_types"] = completed
+        result["partial"] = bool(completed)
+        result["warnings"] = [
+            f"DNS {rtype}: {detail}" for rtype, detail in failures
+        ]
+        if not completed:
+            result["error"] = f"Fallo de resolucion DNS: {failures[0][1]}"
     return result
 
-def subdomain_scan(domain: str, wordlist: list = None) -> list:
+def subdomain_scan(domain: str, wordlist: list = None) -> list | dict:
     if wordlist is None:
         wordlist = ["www", "mail", "admin", "blog", "ftp", "api", "dev", "test",
                      "webmail", "panel", "git", "jenkins", "ssh", "docs", "support",
                      "backup", "db", "mysql", "cpanel"]
     found = []
-    def _check(sub: str) -> str | None:
+    completed = 0
+    failures = []
+    not_found_codes = {
+        code
+        for code in (
+            getattr(socket, "EAI_NONAME", None),
+            getattr(socket, "EAI_NODATA", None),
+        )
+        if code is not None
+    }
+
+    def _check(sub: str) -> tuple[str | None, str | None]:
+        hostname = f"{sub}.{domain}"
         try:
-            socket.getaddrinfo(f"{sub}.{domain}", 80, socket.AF_INET, socket.SOCK_STREAM)
-            return f"{sub}.{domain}"
-        except (socket.gaierror, OSError):
-            return None
+            socket.getaddrinfo(hostname, 80, socket.AF_INET, socket.SOCK_STREAM)
+            return hostname, None
+        except socket.gaierror as e:
+            if e.errno in not_found_codes:
+                return None, None
+            return None, f"{hostname}: {str(e).strip() or type(e).__name__}"
+        except OSError as e:
+            return None, f"{hostname}: {str(e).strip() or type(e).__name__}"
     with ThreadPoolExecutor(max_workers=20) as executor:
         futuros = {executor.submit(_check, s): s for s in wordlist}
         for fut in as_completed(futuros):
-            r = fut.result()
+            r, failure = fut.result()
             if r:
                 found.append(r)
-    return sorted(found)
+            if failure:
+                failures.append(failure)
+            else:
+                completed += 1
+    found = sorted(found)
+    if failures:
+        result = {
+            "target": domain,
+            "found": found,
+            "completed_lookups": completed,
+            "failed_lookups": len(failures),
+            "partial": bool(completed),
+            "warnings": failures,
+        }
+        if not completed:
+            result["error"] = (
+                f"Fallo de resolucion de subdominios: {failures[0]}"
+            )
+        return result
+    return found
 
 def get_local_ip(_target: str | None = None) -> dict:
     """Obtiene IP local, subred y gateway de todas las interfaces activas."""

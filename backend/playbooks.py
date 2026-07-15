@@ -1,4 +1,5 @@
 import logging
+import urllib.parse
 
 log = logging.getLogger("artenisa.playbooks")
 
@@ -17,7 +18,7 @@ PLAYBOOKS = {
     "recon_web": {
         "name": "Reconocimiento Web",
         "description": "Recolecta información pública de un dominio: DNS, subdominios, puertos, tecnologías y directorios",
-        "target_type": "domain",
+        "target_type": "url",
         "depth_estimate": "medio",
         "steps": [
             {"id": "dns", "label": "Enumeration DNS", "tool": "dns_enum"},
@@ -99,6 +100,47 @@ def list_playbooks() -> dict:
     }
 
 
+def _result_error_note(data) -> str | None:
+    if isinstance(data, dict):
+        if data.get("error"):
+            return str(data["error"])
+        if data.get("status") == 0:
+            return "Error de transporte HTTP"
+
+    def error_string(value):
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        normalized = text.casefold()
+        if (
+            normalized == "error"
+            or normalized.startswith("error:")
+            or normalized.startswith("error ")
+        ):
+            return text
+        return None
+
+    if isinstance(data, str):
+        return error_string(data)
+    if isinstance(data, list) and data:
+        notes = [error_string(item) for item in data]
+        if all(note is not None for note in notes):
+            return "; ".join(notes)
+    return None
+
+
+def _result_warning_note(data) -> str | None:
+    if not isinstance(data, dict):
+        return None
+    warnings = data.get("warnings")
+    if isinstance(warnings, str):
+        warnings = [warnings]
+    if not isinstance(warnings, list) or not warnings:
+        return "Parcial" if data.get("partial") else None
+    prefix = "Parcial" if data.get("partial") else "Aviso"
+    return f"{prefix}: {'; '.join(str(warning) for warning in warnings)}"
+
+
 def run_playbook(
     name,
     target,
@@ -121,6 +163,18 @@ def run_playbook(
 
     total = len(pb["steps"]) or 1
     results = []
+    web_target = None
+    if name in {"recon_web", "web_audit"}:
+        parsed_target = urllib.parse.urlsplit(target)
+        query = urllib.parse.parse_qsl(
+            parsed_target.query, keep_blank_values=True
+        )
+        web_target = {
+            "hostname": parsed_target.hostname,
+            "port": parsed_target.port
+            or (443 if parsed_target.scheme.casefold() == "https" else 80),
+            "query_parameter": query[0][0] if query else "q",
+        }
 
     for i, step in enumerate(pb["steps"]):
         pct = int((i / total) * 100)
@@ -141,8 +195,15 @@ def run_playbook(
             if tech_fn:
                 try:
                     tech_data = tech_fn(target)
-                    step_result["data"] = {"headers": tech_data.get("headers", {})}
-                    step_result["success"] = True
+                    error_note = _result_error_note(tech_data)
+                    if error_note:
+                        step_result["data"] = tech_data
+                        step_result["note"] = error_note
+                    else:
+                        step_result["data"] = {
+                            "headers": tech_data.get("headers", {})
+                        }
+                        step_result["success"] = True
                 except Exception as e:
                     step_result["note"] = str(e)
             else:
@@ -173,9 +234,22 @@ def run_playbook(
             continue
 
         try:
-            data = tool_fn(target)
+            args = (target,)
+            if web_target:
+                if step["id"] in {"dns", "subdomains", "ports"}:
+                    args = (web_target["hostname"],)
+                elif step["id"] == "ssl":
+                    args = (web_target["hostname"], web_target["port"])
+                elif step["id"] in {"sqli", "xss", "lfi"}:
+                    args = (target, web_target["query_parameter"])
+            data = tool_fn(*args)
             step_result["data"] = data
-            step_result["success"] = True
+            error_note = _result_error_note(data)
+            if error_note:
+                step_result["note"] = error_note
+            else:
+                step_result["success"] = True
+                step_result["note"] = _result_warning_note(data)
         except TypeError as e:
             step_result["note"] = f"Error de parámetros: {e}"
         except Exception as e:
@@ -198,7 +272,7 @@ def run_playbook(
             findings_count=sum(1 for r in results if r.get("success")),
         )
 
-    return {
+    response = {
         "playbook": name,
         "target": target,
         "depth": depth,
@@ -206,6 +280,9 @@ def run_playbook(
         "results": results,
         "summary": summary,
     }
+    if not any(result.get("success") for result in results):
+        response["error"] = "Todos los pasos del playbook fallaron"
+    return response
 
 
 def _build_summary(pb, results) -> str:
