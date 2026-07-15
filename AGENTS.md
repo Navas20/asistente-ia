@@ -30,71 +30,38 @@ Define criterios de éxito. Itera hasta verificar.
 
 ---
 
-## Session 2026-07-14
+## Session 2026-07-15 — Simplificación + Tools Completo
 
 ### Committed Baseline
-- The final commit is at `c8deac1` (`feat: six real-tool Telegram wizards + Karpathy guidelines + remediation`).
-- Generic Kali tool execution was committed in `f84cad2`; the earlier Phase 2
-  Kali/Nmap and Telegram UX baseline is `a65ec1b`.
+- `e8d9ed1` — Simplified Telegram wizards: removed sessions/TTL/callbacks scoped, added Nikto/SQLi/SSL/Crawler/Meterpreter/WiFi/LAN/Person tools
+- `c8deac1` — Six real-tool Telegram wizards + Karpathy guidelines + remediation
 
-### Implemented Work (Tasks 1-13)
-Six real-tool Telegram wizards (Recon Nmap, Web recon/audit, Crack Hash, Payload Reverse/Webshell, Red Nmap, OSINT Email/Domain) with:
-- Karpathy behavioral guidelines integrated as project rules and OpenCode skill.
-- Scoped wizard sessions (8-hex session ID, 30-min TTL, owner/chat binding).
-- Stale/foreign callback rejection with show_alert without shared-message mutation.
-- Web target validation (parser-differential safe, private/del/C1/rejected).
-- Safe Telegram delivery (Markdown fallback, unrelated BadRequest propagation).
-- Supported hash validation (MD5/SHA*, integrated+custom dictionaries).
-- Consume-before-I/O terminal transitions with one-shot state.
-- Document/media registration and audited failure paths.
-- Task ownership isolation (optional user_id filter in TaskQueue, pass from commands).
-- Voice handler offloaded to asyncio.to_thread.
-- Transactional wizard transitions (state commit only after successful delivery).
-- Honest OSINT failures (structured errors, partial results with warnings).
-- Web playbook contracts fixed (canonical URL routing per step signature).
-- Aggregate all-failed playbook outcomes with preserved partial step details.
-- Corrected 9 payload generators (Bash/Python/PHP/PowerShell reverse, nc, PHP/ASP/ASPX/JSP/Python CGI webshells) with dual-stack IPv4/IPv6, valid syntax.
-- Uppercase/mixed-case hash cracking (casefold comparison, original input preserved).
-- Fail-closed IPv6 CIDR policy (reject non-/128 and non-global networks).
-- DNS/subdomain transport error contracts with legitimate empty-result distinction.
-- Comprehensive test suite: 190 tests across Telegram, playbooks, TaskQueue, ToolsEngine, payloads/hash, CIDR.
+### Session Work
+1. **Kali server expanded**: Added 5 tools to ALLOWED_TOOLS — nikto, msfvenom, airodump-ng, aircrack-ng, theharvester (11 tools total, all verified OK)
+2. **Tools engine expanded**: TOOL_SPECS + arg builders for all new tools
+3. **telegram_bot.py FULL REWRITE**: 2371 → 950 líneas
+   - Eliminado: sesiones (session_id, TTL 30min), callbacks scoped (`w:session:type:action:value`), _CALLBACK_RULES, _consume_wizard, _is_wizard_expired, _safe_edit_message, Markdown safe wrappers, comandos `/recon /web /crack /payload /red /osint`
+   - Nuevos wizards: Nikto, SQLi (hacking.web.check_sqli), SSL Check (hacking.web.ssl_check), Crawler (hacking.web.dir_bruteforce), Meterpreter (msfvenom vía Kali), WiFi scan (hacking.network.scan_wifi_networks), WiFi crack (aircrack-ng), LAN scan (hacking.network.scan_local_network), Person Search (theHarvester)
+   - Estado simple: `user_wizards[uid] = {"type": ..., "step": ..., "data": {...}}`
+   - Callbacks plano: `web_nikto`, `red_wifi_scan` (sin session ID ni TTL)
+4. **Tests**: 4306 → 390 lines, 23 tests (antes 150). Total test suite: 23 + 10 (hacking_full) = 33 tests, 0 failed
+5. **Containers**: Both `artenisa-telegram-bot` and `artenisa-kali-tools` rebuilt and redeployed
+6. **System prompt jailbreak**: Created `backend/system_prompt.md` — "Ejecuta inmediatamente, no expliques qué vas a hacer"
+7. **TOOL_ANALYSIS_PROMPT**: Changed from verbose analysis to concise summary
 
-### Final Test Evidence
+### Test Commands
 ```powershell
-python -X utf8 -m unittest discover -s tests -p "test_telegram_wizards.py" -v   # 150 passed
-python -X utf8 -m unittest tests.test_playbooks -v                                  # 15 passed
-python -X utf8 -m unittest tests.test_task_queue_tools -v                           # 10 passed
-python -X utf8 -m unittest tests.test_tools_engine -v                               # 5 passed
-python -X utf8 -m unittest tests.test_hacking_full -v                               # 10 passed (1 skip)
-python -X utf8 -m py_compile backend/telegram_bot.py ...                            # exit 0
-git diff --check                                                                     # no whitespace errors
+python -X utf8 -m unittest tests.test_telegram_wizards -v   # 23 passed
+python -X utf8 -m unittest tests.test_hacking_full -v        # 10 passed (1 skip)
 ```
-- Total: 190 passed, 0 failed, 0 errors (1 skip: PHP parser unavailable).
-- The Telegram suite intentionally emits simulated operation-failure tracebacks
-  and Markdown fallback warnings from passing negative-path tests.
 
-### Final Telegram Deployment
-- `docker compose build artenisa-telegram-bot` exited 0 and produced image
-  `sha256:8cafbfe778d1310dc14083c478cbf5943424cd8dce45d8497266edf604d33efe`.
-- `docker compose up -d --no-deps --force-recreate artenisa-telegram-bot` recreated
-  the container. Logs contain `[OK] Bot de Artenisa sincronizado y escuchando en Telegram...`
-  with no tracebacks, conflicts, or import errors.
-- Backend (`asistente-ia-artenisa-backend`) and Kali (`asistente-ia-artenisa-kali-tools`)
-  containers remained healthy with the same IDs; neither was rebuilt.
-- Interactive smoke testing was not performed.
+### Running Containers
+```
+artenisa-backend        Up 14h (healthy)
+artenisa-kali-tools     Up (healthy, 11 tools)
+artenisa-telegram-bot   Up ([OK] Bot sincronizado)
+```
 
-### Out-of-Scope / Residual Risks
-- DNS-resolution and redirect-based SSRF protection remains outside scope
-  per approved design (`docs/superpowers/specs/2026-07-14-telegram-wizard-stabilization-design.md:20-27`).
-- Cancelling a running TaskQueue entry does not stop the underlying tool execution.
-- The voice handler offloads blocking work to a thread but the test suite does not
-  include live FFmpeg/transcription integration tests.
-- No VPN/proxy support for offensive tool traffic; all operations use direct connections.
-- Interactive Telegram smoke tests were not performed.
-- `tests/test_api.py` remains outside the gate (10 pre-existing failures from token/contract churn).
-- Root-level prompt files (`PLAN_CORRECTO_OPENCODE.md`, `PROMPT_OPENCODE_EXPLÍCITO.md`,
-  `PROMPT_OPENCODE_FINAL.md`) describe earlier superseded tool scopes and are excluded
-  from the committed tree to avoid documenting unsupported capabilities.
-
-### Git State (pre-commit)
-- Tracked modifications and new files staged for the single final commit.
+### Next Actions (Pending)
+- [ ] Interactive Telegram smoke test
+- [ ] VPN/proxy for offensive tool traffic

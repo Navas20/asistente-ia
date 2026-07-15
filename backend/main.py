@@ -675,9 +675,9 @@ def search_web(query: str) -> str:
         return f"[Error de búsqueda: {e}]"
 
 TOOL_ANALYSIS_PROMPT = """
-Has ejecutado una herramienta. Analiza el resultado y responde al usuario
-con un análisis útil estilo Artenisa: técnico, preciso y con personalidad.
-Explica vulnerabilidades encontradas y sugiere próximos pasos.
+Resume el resultado de la herramienta en 1-2 párrafos claros. Sin preámbulo.
+Si es un análisis de seguridad, enumera los hallazgos clave. Si es información, preséntala directo.
+No digas "el resultado muestra" ni "como se puede observar". Solo entrega los datos.
 """
 
 TAREAS_DB = {}
