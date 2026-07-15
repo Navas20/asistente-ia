@@ -49,6 +49,11 @@ ALLOWED_TOOLS = {
     "nslookup": "/usr/bin/nslookup",
     "curl": "/usr/bin/curl",
     "ping": "/usr/bin/ping",
+    "nikto": "/usr/bin/nikto",
+    "msfvenom": "/usr/bin/msfvenom",
+    "airodump-ng": "/usr/sbin/airodump-ng",
+    "aircrack-ng": "/usr/bin/aircrack-ng",
+    "theharvester": "/usr/bin/theharvester",
 }
 
 HEALTH_FILE = Path("/tmp/kali_healthy")

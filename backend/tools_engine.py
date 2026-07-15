@@ -73,6 +73,41 @@ TOOL_SPECS = {
         "target_kind": "host",
         "profiles": ["default"],
     },
+    "nikto": {
+        "description": "Escáner de vulnerabilidades web Nikto",
+        "default_timeout": 300,
+        "max_timeout": 600,
+        "target_kind": "url",
+        "profiles": ["default"],
+    },
+    "msfvenom": {
+        "description": "Generador de payloads Metasploit",
+        "default_timeout": 30,
+        "max_timeout": 60,
+        "target_kind": "none",
+        "profiles": ["default"],
+    },
+    "airodump-ng": {
+        "description": "Captura de paquetes WiFi",
+        "default_timeout": 60,
+        "max_timeout": 120,
+        "target_kind": "none",
+        "profiles": ["default"],
+    },
+    "aircrack-ng": {
+        "description": "Cracking de claves WPA/WPA2",
+        "default_timeout": 300,
+        "max_timeout": 600,
+        "target_kind": "none",
+        "profiles": ["default"],
+    },
+    "theharvester": {
+        "description": "Recolección de información OSINT",
+        "default_timeout": 60,
+        "max_timeout": 120,
+        "target_kind": "host",
+        "profiles": ["default"],
+    },
 }
 
 BLOCKED_RANGES = [
@@ -233,6 +268,8 @@ def _build_tool_args(
             str(timeout),
             target,
         ]
+    if tool == "nikto":
+        return ["-h", target, "-o", "/dev/stdout"]
     return [target]
 
 
