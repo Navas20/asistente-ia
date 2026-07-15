@@ -33,7 +33,7 @@ Define criterios de éxito. Itera hasta verificar.
 ## Session 2026-07-14
 
 ### Committed Baseline
-- The final commit is at `71a9023` (`feat: six real-tool Telegram wizards + Karpathy guidelines + remediation`).
+- The final commit is at `c8deac1` (`feat: six real-tool Telegram wizards + Karpathy guidelines + remediation`).
 - Generic Kali tool execution was committed in `f84cad2`; the earlier Phase 2
   Kali/Nmap and Telegram UX baseline is `a65ec1b`.
 
