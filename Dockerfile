@@ -3,7 +3,7 @@ FROM python:3.11-slim
 # Instalar dependencias del sistema necesarias para el backend
 RUN apt update && apt install -y \
     python3-pip python3-venv python3-pyaudio \
-    nmap curl wget netcat-openbsd dnsutils whois \
+    nmap curl wget netcat-openbsd dnsutils whois iputils-ping \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

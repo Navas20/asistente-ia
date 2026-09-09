@@ -26,6 +26,8 @@ from task_queue import TaskQueue
 from security import AuditLog, RateLimiter
 from playbooks import list_playbooks, run_playbook
 from report_generator import generate_report
+from tools_engine import TOOL_SPECS, tools_engine
+import tool_permissions
 import hacking
 
 try:
@@ -148,6 +150,8 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id)")
         log.info("Base de datos inicializada")
+
+    tool_permissions.init_permissions()
 
 init_db()
 
@@ -834,7 +838,33 @@ def process_tool_commands(response_text: str) -> tuple:
 
         m_cmd = TOOL_CMD_RE.match(line)
         if m_cmd:
-            result = execute_command(m_cmd.group(1).strip())
+            raw = m_cmd.group(1).strip()
+            tool_name = _get_tool_name(raw)
+            if tool_name in TOOL_SPECS:
+                from tool_permissions import audit_intent, needs_confirmation, propose
+
+                if needs_confirmation(tool_name):
+                    proposal = (
+                        f"[PROPUESTA] Ejecutar: {raw}. "
+                        "Decime 'sí' para ejecutarlo o 'no' para cancelar."
+                    )
+                    intent = {
+                        "kind": "command",
+                        "user_id": 0,
+                        "tool": tool_name,
+                        "command": raw,
+                        "target": "",
+                        "proposal": proposal,
+                    }
+                    propose(0, intent)
+                    audit_intent(intent, "proposed")
+                    tool_results.append({
+                        "command": f"!ejecutar: {raw}",
+                        "output": proposal,
+                        "pending_confirmation": True,
+                    })
+                    continue
+            result = execute_command(raw)
             tool_results.append(result)
             continue
 
@@ -954,6 +984,113 @@ def process_tool_commands(response_text: str) -> tuple:
 
     return "\n".join(cleaned), tool_results
 
+# ─── Gobernanza de herramientas: permisos y modo plan/build ───
+
+CONFIRMATION_YES_RE = re.compile(
+    r'^\s*(s[ií]|dale|adelante|ok|okay|confirm[oó]|s[ií] dale|d[aá]le noma[sz].*)\s*[.!]*\s*$',
+    re.IGNORECASE,
+)
+CONFIRMATION_NO_RE = re.compile(
+    r'^\s*(no|cancel[aá]|par[aá]|nope|no lo hagas|no corras|rechaz[aá]o)\s*[.!]*\s*$',
+    re.IGNORECASE,
+)
+MODE_SET_RE = re.compile(r'modo\s+(plan|build)', re.IGNORECASE)
+MODE_QUERY_RE = re.compile(
+    r'(en\s?que\s?modo\s?est[aá]s?|modo\s?actual|qu[eé]\s?modo|est[aá]s\s?en\s?modo)',
+    re.IGNORECASE,
+)
+PERM_STATUS_RE = re.compile(
+    r'(qu[eé]\s?herramientas.*confirmaci[óo]n|estado.*(permisos?|confirmaci[óo]n|config.)|pid[e].*confirmaci[óo]n.*a[h]ora|confirmaci[óo]n.*activ[aá]da)',
+    re.IGNORECASE,
+)
+ENABLE_CONF_RE = re.compile(
+    r'(confirmaci[óo]n|ped[ií]|pedime|pregunt[áa]s?|avis[áa]s?|avis[aá]me|quer[eé](s)?\s?que)', re.IGNORECASE)
+DISABLE_CONF_RE = re.compile(
+    r'(dej[aá]\s?de pregunt|dej[aá]|basta|no\s?(me\s?)?preguntes?|no\s?(me\s?)?avis[aá]s?|sin\s?confirmaci[óo]n)',
+    re.IGNORECASE,
+)
+
+
+def _run_pending(intent: dict) -> dict:
+    """Ejecuta de verdad la propuesta que el usuario confirmó."""
+    if intent["kind"] == "tool":
+        result = tools_engine.run_tool(
+            intent["tool"],
+            intent["target"],
+            profile=intent.get("profile", "default"),
+            options=intent.get("options") or {},
+            timeout=intent.get("timeout"),
+            user_id=intent.get("user_id", 0),
+            force_execution=True,
+        )
+        output = (result.stdout or result.stderr or result.error or "").strip()
+        ok = result.success
+    else:
+        result = execute_command(intent.get("command", ""))
+        output = result.get("output", "")
+        ok = result.get("success", False)
+
+    head = "✅ Confirmado y ejecutado." if ok else "⚠️ Confirmado pero la ejecución falló."
+    return {
+        "response": f"{head}\n\n{intent.get('proposal', '')}\n\n{output}",
+        "tool_output": output,
+    }
+
+
+def handle_special_message(message: str, user_id: int = 0) -> dict | None:
+    """Mensajes que Artenisa resuelve sin el LLM:
+    - confirmación/rechazo de una herramienta pendiente
+    - activar/desactivar confirmación por herramienta
+    - modo plan/build
+    - consulta de estado de permisos.
+    Devuelve None si el mensaje no es de gobernanza."""
+    message = message.strip()
+    if not message:
+        return None
+
+    if tool_permissions.has_pending(user_id):
+        if CONFIRMATION_YES_RE.match(message):
+            intent = tool_permissions.resolve_pending(user_id, confirmed=True)
+            return _run_pending(intent) if intent else {
+                "response": "No había ninguna acción pendiente de confirmación."
+            }
+        if CONFIRMATION_NO_RE.match(message):
+            tool_permissions.resolve_pending(user_id, confirmed=False)
+            return {"response": "Cancelado. No ejecuto nada."}
+
+    lower = message.lower()
+    m_mode = MODE_SET_RE.search(lower)
+    if m_mode:
+        mode = tool_permissions.set_agent_mode(m_mode.group(1).lower())
+        return {"response": f"Ok. Modo {mode} activado."}
+
+    if MODE_QUERY_RE.search(lower) or PERM_STATUS_RE.search(lower):
+        mode = tool_permissions.get_agent_mode()
+        enabled = [p["tool_name"] for p in tool_permissions.list_permissions() if p["requires_confirmation"]]
+        line = "Ninguna herramienta pide confirmación individual."
+        if enabled:
+            line = "Confirmación individual activada para: " + ", ".join(enabled) + "."
+        return {"response": f"Modo actual: {mode}. {line}"}
+
+    words = set(re.findall(r"[a-z0-9][\w\-]*", lower))
+    found = [t for t in TOOL_SPECS if t in words]
+    if found:
+        if DISABLE_CONF_RE.search(lower):
+            for t in found:
+                tool_permissions.set_permission(t, False)
+            return {"response": f"Ok, no te vuelvo a pedir confirmación por {', '.join(found)}."}
+        if ENABLE_CONF_RE.search(lower):
+            for t in found:
+                tool_permissions.set_permission(t, True)
+            return {
+                "response": (
+                    f"Ok. A partir de ahora te pido confirmación antes de usar {', '.join(found)} "
+                    f"(modo actual: {tool_permissions.get_agent_mode()})."
+                )
+            }
+
+    return None
+
 # ─── Endpoints ───
 
 @app.get("/")
@@ -971,6 +1108,21 @@ def chat(req: ChatRequest, authorization: str = Header(None)):
     start = datetime.utcnow()
 
     conv_id = req.conversation_id or str(uuid.uuid4())
+
+    special = handle_special_message(req.message)
+    if special:
+        final_text = special.get("response", "")
+        tool_output = special.get("tool_output")
+        save_message(conv_id, "user", req.message)
+        save_message(conv_id, "assistant", final_text, tool_output)
+        return ChatResponse(
+            response=final_text,
+            conversation_id=conv_id,
+            tool_executed=bool(tool_output),
+            tool_command=special.get("tool_command"),
+            tool_output=tool_output[:2000] if tool_output else None,
+        )
+
     memories = load_all_memories()
     history = get_history(conv_id) if req.conversation_id else []
     prompt = build_prompt(history, req.message, memories)
@@ -1021,6 +1173,15 @@ def chat_stream(req: ChatRequest, authorization: str = Header(None)):
     def event_generator():
         full_response = []
         try:
+            special = handle_special_message(req.message)
+            if special:
+                final_text = special.get("response", "")
+                tool_output = special.get("tool_output")
+                save_message(conv_id, "user", req.message)
+                save_message(conv_id, "assistant", final_text, tool_output)
+                yield f"data: {json.dumps({'type': 'done', 'conversation_id': conv_id, 'response': final_text, 'tool_executed': bool(tool_output), 'tool_command': special.get('tool_command'), 'tool_output': (tool_output or '')[:2000]})}\n\n"
+                return
+
             p = _get_provider()
             for token in p.generate_stream(prompt):
                 full_response.append(token)
@@ -1632,7 +1793,7 @@ def set_provider_model(data: dict = Body(...), authorization: str = Header(None)
     verify_token(authorization)
     model = data.get("model", "")
     if not model:
-        raise HTTPException(400, "Model name required")
+        raise HTTPException(400, "Se requiere el nombre del modelo")
     switch_model(model)
     return {"status": "ok", "model": model}
 

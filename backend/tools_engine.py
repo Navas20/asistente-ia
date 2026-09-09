@@ -134,6 +134,7 @@ class ToolResult:
         elapsed: float = 0.0,
         truncated: bool = False,
         error: str = "",
+        pending_confirmation: bool = False,
     ):
         self.success = success
         self.stdout = stdout
@@ -143,6 +144,7 @@ class ToolResult:
         self.elapsed = elapsed
         self.truncated = truncated
         self.error = error
+        self.pending_confirmation = pending_confirmation
 
     def to_dict(self) -> dict:
         return {
@@ -154,6 +156,7 @@ class ToolResult:
             "elapsed": self.elapsed,
             "truncated": self.truncated,
             "error": self.error,
+            "pending_confirmation": self.pending_confirmation,
         }
 
 
@@ -331,6 +334,7 @@ class ToolsEngine:
         options: dict[str, Any] | None = None,
         timeout: int | None = None,
         user_id: int = 0,
+        force_execution: bool = False,
     ) -> ToolResult:
         spec = TOOL_SPECS.get(tool)
         if not spec:
@@ -355,6 +359,34 @@ class ToolsEngine:
         limit_error = self._check_per_user_limit(user_id)
         if limit_error:
             return ToolResult(success=False, error=limit_error)
+
+        if not force_execution:
+            # Middleware de permisos: modo plan o confirmación individual
+            from tool_permissions import audit_intent, needs_confirmation, propose
+
+            if needs_confirmation(tool):
+                proposal = (
+                    f"[PROPUESTA] Ejecutar {tool} -> target: {target}"
+                    f", perfil: {profile}, timeout: {actual_timeout}s."
+                    " Decime 'sí' para ejecutarlo o 'no' para cancelar."
+                )
+                intent = {
+                    "kind": "tool",
+                    "user_id": user_id,
+                    "tool": tool,
+                    "target": target,
+                    "profile": profile,
+                    "options": options,
+                    "timeout": actual_timeout,
+                    "proposal": proposal,
+                }
+                propose(user_id, intent)
+                audit_intent(intent, "proposed")
+                return ToolResult(
+                    success=True,
+                    stdout=proposal,
+                    pending_confirmation=True,
+                )
 
         try:
             args = _build_tool_args(tool, target, profile, options or {}, actual_timeout)
