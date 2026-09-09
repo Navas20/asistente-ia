@@ -1,4 +1,4 @@
-FROM dolphin-llama3:8b
+FROM hermes3:8b
 
 PARAMETER temperature 0.85
 PARAMETER top_p 1.0
