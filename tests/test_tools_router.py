@@ -37,7 +37,7 @@ class ToolsRouterTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         names = {tool["name"] for tool in response.json()["tools"]}
-        self.assertEqual(names, {"nmap", "whois", "dig", "nslookup", "curl", "ping"})
+        self.assertEqual(names, {"nmap", "whois", "dig", "nslookup", "curl", "ping", "nikto", "msfvenom", "airodump-ng", "aircrack-ng", "theharvester"})
 
     def test_generic_tool_endpoint_runs_supported_non_nmap_tool(self):
         result = ToolResult(success=True, stdout="WHOIS DATA")
