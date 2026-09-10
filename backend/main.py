@@ -4,7 +4,6 @@ import sqlite3
 import uuid
 import httpx
 import re
-import subprocess
 import threading
 import logging
 from datetime import datetime
@@ -26,7 +25,6 @@ from task_queue import TaskQueue
 from security import AuditLog, RateLimiter
 from playbooks import list_playbooks, run_playbook
 from report_generator import generate_report
-from tools_engine import TOOL_SPECS, tools_engine
 import tool_permissions
 import hacking
 
@@ -86,7 +84,6 @@ MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "8"))
 MAX_MESSAGE_CHARS = int(os.getenv("MAX_MESSAGE_CHARS", "1800"))
 MAX_MEMORY_ITEMS = int(os.getenv("MAX_MEMORY_ITEMS", "6"))
 MAX_MEMORY_CHARS = int(os.getenv("MAX_MEMORY_CHARS", "600"))
-TOOL_TIMEOUT = int(os.getenv("TOOL_TIMEOUT", "60"))
 
 MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", str(20 * 1024 * 1024)))  # 20MB
 ALLOWED_EXTENSIONS = {".wav", ".mp3", ".ogg", ".flac", ".m4a", ".png", ".jpg", ".jpeg", ".gif", ".pdf", ".txt", ".py", ".md", ".json"}
@@ -398,41 +395,11 @@ CUANDO AYUDES EN PROYECTOS:
 TU OBJETIVO:
 Ser la mejor asistente de programación y pensamiento técnico para mí. Entenderme como si fueras mi copiloto de ingeniería: útil, rápida, precisa y profundamente competente.
 
-HERRAMIENTAS DISPONIBLES (escribe el comando exacto en tu respuesta para usarlas):
-!leer: ruta              - Lee archivos (txt, md, py, json, etc.)
-!leerpdf: ruta           - Lee archivos PDF y extrae su texto
-!escribir: ruta contenido - Crea/escribe archivos
-!editar: ruta "viejo" "nuevo" - Reemplaza texto exacto
-!mover: origen destino   - Mueve o renombra archivos/carpetas
-!copiar: origen destino  - Copia archivos/carpetas
-!eliminar: ruta          - Elimina archivos o carpetas
-!ver: ruta               - Lee imágenes (extrae texto con OCR)
-!revisar: ruta           - Revisa código y da feedback línea por línea
-!diff: ruta              - Muestra cambios sin commit (git diff)
-!crear: tipo nombre      - Crea proyecto desde template (python, fastapi, react, cli)
-!github: comando args    - GitHub: repos, issues, prs, create_issue, create_pr, status
-!navegar: url acción     - Navega sitios web (html, screenshot, links, click selector, fill selector valor)
-!buscar: consulta        - Busca en internet
-!grep: patrón ruta       - Busca texto en archivos
-!glob: patrón            - Encuentra archivos por nombre
-!ejecutar: comando       - Ejecuta comandos en el sistema
-!fetch: url              - Trae contenido web
-!explorar: ruta          - Explora estructura de carpetas
-!preguntar: texto        - Pregunta algo al usuario
-!tareas: inicio/paso/hecho - Seguimiento de tareas
-!razonar: problema       - Piensa paso a paso antes de responder
-
 REGLAS:
-- Responde de forma natural primero. No conviertas cada mensaje en una cascada de herramientas.
+- Responde de forma natural primero. No conviertas cada mensaje en una cascada de acciones.
 - Usa herramientas solo cuando sean claramente útiles, necesarias o el usuario haya pedido una acción concreta.
 - Si el problema es simple o conversacional, responde directamente sin herramientas.
-- Si necesitas datos reales, ESCRIBE el comando exacto en tu respuesta. Yo lo ejecuto y te doy el resultado.
-- Ejemplo: !leer: C:/Users/ASUS/archivo.txt
-- No digas "voy a leer" — directamente escribe !leer:
-- Para editar usa !editar: ruta "texto exacto a reemplazar" "texto nuevo"
-- Para tareas usa !tareas: inicio "nombre", !tareas: paso "descripción", !tareas: hecho N
-- Para razonar usa !razonar: problema y analiza paso a paso
-- Siempre obtén datos reales. No inventes. Zero filtros."""
+- Siempre obtené datos reales. No inventes información ni resultados. Zero filtros."""
 
 def build_prompt(history: list, new_message: str, memories: dict) -> str:
     parts = []
@@ -446,180 +413,10 @@ def build_prompt(history: list, new_message: str, memories: dict) -> str:
     for h in _prepare_history_for_prompt(history):
         role = "user" if h["role"] == "user" else "assistant"
         content = h["content"]
-        if h.get("tool_output"):
-            content += f"\n[Resultado: {h['tool_output']}]"
         parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
     parts.append(f"<|im_start|>user\n{_truncate_text(new_message, 2200)}<|im_end|>")
     parts.append("<|im_start|>assistant\n")
     return "\n".join(parts)
-
-import shlex
-
-# ─── Seguridad: evitar shell=True ───
-
-def _safe_args(cmd: str) -> list:
-    """Convierte un comando string en lista de argumentos segura."""
-    try:
-        return shlex.split(cmd, posix=False)
-    except ValueError:
-        return cmd.split()
-
-TOOL_CMD_RE = re.compile(r'!ejecutar:\s*(.+)', re.IGNORECASE)
-TOOL_SEARCH_RE = re.compile(r'!buscar:\s*(.+)', re.IGNORECASE)
-TOOL_READ_RE = re.compile(r'!leer:\s*(.+)', re.IGNORECASE)
-TOOL_READPDF_RE = re.compile(r'!leerpdf:\s*(.+)', re.IGNORECASE)
-TOOL_WRITE_RE = re.compile(r'!escribir:\s*(.+)', re.IGNORECASE)
-TOOL_GREP_RE = re.compile(r'!grep:\s*(.+)', re.IGNORECASE)
-TOOL_GLOB_RE = re.compile(r'!glob:\s*(.+)', re.IGNORECASE)
-TOOL_FETCH_RE = re.compile(r'!fetch:\s*(.+)', re.IGNORECASE)
-TOOL_EDIT_RE = re.compile(r'!editar:\s*(.+)', re.IGNORECASE)
-TOOL_MOVER_RE = re.compile(r'!mover:\s*(.+)', re.IGNORECASE)
-TOOL_COPIAR_RE = re.compile(r'!copiar:\s*(.+)', re.IGNORECASE)
-TOOL_ELIMINAR_RE = re.compile(r'!eliminar:\s*(.+)', re.IGNORECASE)
-TOOL_VER_RE = re.compile(r'!ver:\s*(.+)', re.IGNORECASE)
-TOOL_REVISAR_RE = re.compile(r'!revisar:\s*(.+)', re.IGNORECASE)
-TOOL_DIFF_RE = re.compile(r'!diff:\s*(.+)', re.IGNORECASE)
-TOOL_CREAR_RE = re.compile(r'!crear:\s*(.+)', re.IGNORECASE)
-TOOL_GITHUB_RE = re.compile(r'!github:\s*(.+)', re.IGNORECASE)
-TOOL_NAVEGAR_RE = re.compile(r'!navegar:\s*(.+)', re.IGNORECASE)
-TOOL_PREGUNTAR_RE = re.compile(r'!preguntar:\s*(.+)', re.IGNORECASE)
-TOOL_TAREAS_RE = re.compile(r'!tareas:\s*(.+)', re.IGNORECASE)
-TOOL_EXPLORAR_RE = re.compile(r'!explorar:\s*(.+)', re.IGNORECASE)
-TOOL_RAZONAR_RE = re.compile(r'!razonar:\s*(.+)', re.IGNORECASE)
-
-TOOL_INTERRUPTED = False
-
-def parse_tool_commands(text: str) -> list:
-    commands = []
-    for m in TOOL_CMD_RE.finditer(text):
-        cmd = m.group(1).strip()
-        if cmd:
-            commands.append(cmd)
-    for m in TOOL_SEARCH_RE.finditer(text):
-        query = m.group(1).strip()
-        if query:
-            commands.append(("search", query))
-    for m in TOOL_READ_RE.finditer(text):
-        commands.append(("read", m.group(1).strip()))
-    for m in TOOL_READPDF_RE.finditer(text):
-        commands.append(("readpdf", m.group(1).strip()))
-    for m in TOOL_WRITE_RE.finditer(text):
-        commands.append(("write", m.group(1).strip()))
-    for m in TOOL_MOVER_RE.finditer(text):
-        commands.append(("mover", m.group(1).strip()))
-    for m in TOOL_COPIAR_RE.finditer(text):
-        commands.append(("copiar", m.group(1).strip()))
-    for m in TOOL_ELIMINAR_RE.finditer(text):
-        commands.append(("eliminar", m.group(1).strip()))
-    for m in TOOL_VER_RE.finditer(text):
-        commands.append(("ver", m.group(1).strip()))
-    for m in TOOL_REVISAR_RE.finditer(text):
-        commands.append(("revisar", m.group(1).strip()))
-    for m in TOOL_DIFF_RE.finditer(text):
-        commands.append(("diff", m.group(1).strip()))
-    for m in TOOL_CREAR_RE.finditer(text):
-        commands.append(("crear", m.group(1).strip()))
-    for m in TOOL_GITHUB_RE.finditer(text):
-        commands.append(("github", m.group(1).strip()))
-    for m in TOOL_NAVEGAR_RE.finditer(text):
-        commands.append(("navegar", m.group(1).strip()))
-    for m in TOOL_GREP_RE.finditer(text):
-        commands.append(("grep", m.group(1).strip()))
-    for m in TOOL_GLOB_RE.finditer(text):
-        commands.append(("glob", m.group(1).strip()))
-    for m in TOOL_FETCH_RE.finditer(text):
-        commands.append(("fetch", m.group(1).strip()))
-    for m in TOOL_EDIT_RE.finditer(text):
-        commands.append(("edit", m.group(1).strip()))
-    for m in TOOL_PREGUNTAR_RE.finditer(text):
-        commands.append(("preguntar", m.group(1).strip()))
-    for m in TOOL_TAREAS_RE.finditer(text):
-        commands.append(("tareas", m.group(1).strip()))
-    for m in TOOL_EXPLORAR_RE.finditer(text):
-        commands.append(("explorar", m.group(1).strip()))
-    for m in TOOL_RAZONAR_RE.finditer(text):
-        commands.append(("razonar", m.group(1).strip()))
-    return commands
-
-TOOL_INSTALLERS = {
-    "nmap": ["winget", "install", "--id", "Insecure.Nmap", "-e", "--source", "winget"],
-    "curl": ["winget", "install", "--id", "cURL.cURL", "-e", "--source", "winget"],
-    "wget": ["winget", "install", "--id", "GNU.Wget2", "-e", "--source", "winget"],
-    "ping": ["cmd", "/c", "echo", "ya instalado en Windows"],
-    "tracert": ["cmd", "/c", "echo", "ya instalado en Windows"],
-    "netstat": ["cmd", "/c", "echo", "ya instalado en Windows"],
-    "ipconfig": ["cmd", "/c", "echo", "ya instalado en Windows"],
-    "findstr": ["cmd", "/c", "echo", "ya instalado en Windows"],
-    "python": ["cmd", "/c", "echo", "ya instalado"],
-    "pip": ["cmd", "/c", "echo", "ya instalado"],
-    "ssh": ["winget", "install", "--id", "Microsoft.OpenSSH.Beta", "-e", "--source", "winget"],
-    "git": ["winget", "install", "--id", "Git.Git", "-e", "--source", "winget"],
-    "whois": ["winget", "install", "--id", "whois", "-e", "--source", "winget"],
-    "dig": ["winget", "install", "--id", "BIND.BIND", "-e", "--source", "winget"],
-    "nslookup": ["cmd", "/c", "echo", "ya instalado en Windows"],
-    "sqlmap": ["pip", "install", "sqlmap"],
-    "hydra": ["winget", "install", "--id", "Thc.Hydra", "-e", "--source", "winget"],
-}
-
-NOT_FOUND_PATTERNS = [
-    "no se reconoce", "not recognized", "not found", "no instalado",
-    "not installed", "no such file", "command not found",
-    "is not recognized", "is not installed",
-]
-
-def _get_tool_name(command: str) -> str:
-    cmd = command.strip().split()[0].lower()
-    return cmd.split("\\")[-1].split("/")[-1]
-
-def _auto_install(tool: str) -> str:
-    installer = TOOL_INSTALLERS.get(tool)
-    if not installer:
-        return f"No sé cómo instalar {tool}. Instalalo manualmente."
-    try:
-        log.info(f"Instalando {tool}...")
-        result = subprocess.run(installer, capture_output=True, text=True, timeout=120)
-        if result.returncode == 0 or "instalado" in (result.stdout + result.stderr).lower():
-            return f"✅ {tool} instalado correctamente."
-        else:
-            return f"⚠️ Error instalando {tool}: {result.stderr[:500]}"
-    except subprocess.TimeoutExpired:
-        return f"⚠️ Timeout instalando {tool}"
-    except Exception as e:
-        return f"⚠️ Error: {e}"
-
-def execute_command(command: str, auto_install: bool = True) -> dict:
-    tool = _get_tool_name(command)
-    args = _safe_args(command)
-    for attempt in range(2):
-        try:
-            result = subprocess.run(
-                args, capture_output=True, text=True, timeout=TOOL_TIMEOUT
-            )
-            output = (result.stdout or result.stderr or "").strip()
-            if result.returncode != 0 and auto_install and attempt == 0:
-                error_lower = (result.stdout + result.stderr).lower()
-                if any(p in error_lower for p in NOT_FOUND_PATTERNS):
-                    install_msg = _auto_install(tool)
-                    if install_msg.startswith("✅"):
-                        log.info(f"Reintentando {command} después de instalar {tool}")
-                        continue
-                    return {
-                        "command": command,
-                        "success": False,
-                        "output": f"{install_msg}\n\nReintenta el comando.",
-                        "returncode": result.returncode
-                    }
-            return {
-                "command": command,
-                "success": result.returncode == 0,
-                "output": output[:8000] if output else "(sin salida)",
-                "returncode": result.returncode
-            }
-        except subprocess.TimeoutExpired:
-            return {"command": command, "success": False, "output": "[Timeout]"}
-        except Exception as e:
-            return {"command": command, "success": False, "output": f"[Error: {e}]"}
-    return {"command": command, "success": False, "output": "[Error: no se pudo ejecutar]"}
 
 def search_web(query: str) -> str:
     try:
@@ -678,418 +475,6 @@ def search_web(query: str) -> str:
     except Exception as e:
         return f"[Error de búsqueda: {e}]"
 
-TOOL_ANALYSIS_PROMPT = """
-Resume el resultado de la herramienta en 1-2 párrafos claros. Sin preámbulo.
-Si es un análisis de seguridad, enumera los hallazgos clave. Si es información, preséntala directo.
-No digas "el resultado muestra" ni "como se puede observar". Solo entrega los datos.
-"""
-
-TAREAS_DB = {}
-TAREAS_FILE = Path(__file__).parent / "data" / "tareas.json"
-
-def _load_tareas():
-    global TAREAS_DB
-    if TAREAS_FILE.exists():
-        try:
-            TAREAS_DB = json.loads(TAREAS_FILE.read_text())
-        except (json.JSONDecodeError, FileNotFoundError):
-            TAREAS_DB = {}
-    return TAREAS_DB
-
-def _save_tareas():
-    TAREAS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    TAREAS_FILE.write_text(json.dumps(TAREAS_DB, indent=2, ensure_ascii=False))
-
-def _handle_tareas(arg: str) -> dict:
-    _load_tareas()
-    conv_key = f"conv_{datetime.utcnow().date()}"
-    if conv_key not in TAREAS_DB:
-        TAREAS_DB[conv_key] = {"pasos": [], "actual": 0}
-    parts = arg.strip().split(" ", 1)
-    accion = parts[0].lower()
-    data = parts[1] if len(parts) > 1 else ""
-    if accion == "inicio":
-        TAREAS_DB[conv_key] = {"pasos": [], "actual": 0}
-        _save_tareas()
-        return {"status": "iniciado", "tarea": data or "General"}
-    elif accion in ("paso", "+"):
-        TAREAS_DB[conv_key]["pasos"].append({"id": len(TAREAS_DB[conv_key]["pasos"]) + 1, "desc": data, "hecho": False})
-        _save_tareas()
-        return {"status": "paso agregado", "paso": len(TAREAS_DB[conv_key]["pasos"]), "desc": data}
-    elif accion in ("hecho", "ok", "x"):
-        n = int(data) if data.isdigit() else TAREAS_DB[conv_key]["actual"] + 1
-        for p in TAREAS_DB[conv_key]["pasos"]:
-            if p["id"] == n:
-                p["hecho"] = True
-                TAREAS_DB[conv_key]["actual"] = n
-                break
-        _save_tareas()
-        return {"status": f"paso {n} completado"}
-    elif accion == "estado":
-        pendientes = [p for p in TAREAS_DB[conv_key]["pasos"] if not p["hecho"]]
-        completados = [p for p in TAREAS_DB[conv_key]["pasos"] if p["hecho"]]
-        return {"total": len(TAREAS_DB[conv_key]["pasos"]), "completados": len(completados), "pendientes": len(pendientes), "siguiente": pendientes[0] if pendientes else None}
-    return {"status": f"tarea: {arg}"}
-
-
-def _handle_github(arg: str) -> dict:
-    token = os.getenv("GITHUB_TOKEN")
-    if not token:
-        return {"error": "GITHUB_TOKEN no configurado. Ponlo en backend/.env"}
-    try:
-        from github import Github
-        g = Github(token)
-    except ImportError:
-        return {"error": "PyGithub no instalado (pip install PyGithub)"}
-    except Exception as e:
-        return {"error": f"Error conectando a GitHub: {e}"}
-
-    parts = arg.strip().split(" ", 2)
-    action = parts[0].lower() if parts else ""
-    sub = parts[1] if len(parts) > 1 else ""
-    data = parts[2] if len(parts) > 2 else ""
-
-    try:
-        if action == "repos":
-            repos = [r.full_name for r in g.get_user().get_repos()][:30]
-            return {"repos": repos}
-        elif action == "issues":
-            repo = g.get_repo(sub)
-            issues = [{"number": i.number, "title": i.title, "state": i.state} for i in repo.get_issues()[:20]]
-            return {"issues": issues}
-        elif action == "prs":
-            repo = g.get_repo(sub)
-            prs = [{"number": p.number, "title": p.title, "state": p.state} for p in repo.get_pulls(state="all")[:20]]
-            return {"prs": prs}
-        elif action == "create_issue":
-            repo = g.get_repo(sub)
-            issue = repo.create_issue(title=data)
-            return {"issue": issue.number, "title": issue.title, "url": issue.html_url}
-        elif action == "create_pr":
-            repo = g.get_repo(sub)
-            parts_data = data.split(" | ")
-            title = parts_data[0] if parts_data else "PR"
-            body = parts_data[1] if len(parts_data) > 1 else ""
-            head = parts_data[2] if len(parts_data) > 2 else "main"
-            base = parts_data[3] if len(parts_data) > 3 else "main"
-            pr = repo.create_pull(title=title, body=body, head=head, base=base)
-            return {"pr": pr.number, "title": pr.title, "url": pr.html_url}
-        elif action == "status":
-            user = g.get_user()
-            return {"user": user.login, "repos": user.public_repos, "followers": user.followers}
-        else:
-            return {"error": f"Comando no valido. Usa: repos, issues <repo>, prs <repo>, create_issue <repo> <title>, create_pr <repo> <title | body | head | base>, status"}
-    except Exception as e:
-        return {"error": f"GitHub error: {e}"}
-
-def _parse_edit_arg(arg: str) -> dict:
-    import shlex
-    try:
-        parts = shlex.split(arg, posix=False)
-        if len(parts) >= 3:
-            return {"path": parts[0], "old": parts[1].strip('"'), "new": " ".join(p.strip('"') for p in parts[2:])}
-        return None
-    except ValueError:
-        return None
-
-TOOL_HANDLERS = {
-    "read": lambda arg: _exec_httpx("tools/read", {"path": arg}),
-    "readpdf": lambda arg: _exec_httpx("tools/readpdf", {"path": arg}),
-    "write": lambda arg: _exec_httpx("tools/write", {"path": arg.split(" ", 1)[0], "content": arg.split(" ", 1)[1] if " " in arg else ""}),
-    "grep": lambda arg: _exec_httpx("tools/grep", {"pattern": arg.split(" ", 1)[0], "path": arg.split(" ", 1)[1] if " " in arg else "."}),
-    "glob": lambda arg: _exec_httpx("tools/glob", {"pattern": arg}),
-    "fetch": lambda arg: _exec_httpx("tools/fetch", {"url": arg}),
-    "edit": lambda arg: _exec_httpx("tools/edit", {"arg": arg}),
-    "mover": lambda arg: _exec_httpx("tools/move", {"arg": arg}),
-    "copiar": lambda arg: _exec_httpx("tools/copy", {"arg": arg}),
-    "eliminar": lambda arg: _exec_httpx("tools/delete", {"path": arg}),
-    "ver": lambda arg: _exec_httpx("tools/readimg", {"path": arg}),
-    "revisar": lambda arg: _exec_httpx("tools/review", {"path": arg}),
-    "diff": lambda arg: _exec_httpx("tools/diff", {"path": arg}),
-    "crear": lambda arg: _exec_httpx("tools/scaffold", {"arg": arg}),
-    "github": lambda arg: _handle_github(arg),
-    "navegar": lambda arg: _exec_httpx("tools/browse", {"arg": arg}),
-    "explorar": lambda arg: _exec_httpx("tools/explore", {"path": arg}),
-    "preguntar": lambda arg: {"tipo": "pregunta", "pregunta": arg, "esperando": True},
-    "tareas": lambda arg: _handle_tareas(arg),
-    "razonar": lambda arg: _exec_httpx("tools/reason", {"prompt": arg}),
-}
-
-def _exec_httpx(endpoint: str, data: dict) -> dict:
-    try:
-        with httpx.Client(timeout=120) as c:
-            r = c.post(f"http://localhost:8000/{endpoint}", json=data,
-                       headers={"Authorization": f"Bearer {AUTH_TOKEN}"})
-            return r.json() if r.status_code == 200 else {"error": r.text[:500]}
-    except Exception as e:
-        return {"error": str(e)}
-
-def process_tool_commands(response_text: str) -> tuple:
-    global TOOL_INTERRUPTED
-    tool_results = []
-    lines = response_text.split("\n")
-    cleaned = []
-
-    for line in lines:
-        if TOOL_INTERRUPTED:
-            tool_results.append({"command": "!interrumpido", "output": "Ejecución cancelada por el usuario"})
-            TOOL_INTERRUPTED = False
-            break
-
-        m_cmd = TOOL_CMD_RE.match(line)
-        if m_cmd:
-            raw = m_cmd.group(1).strip()
-            tool_name = _get_tool_name(raw)
-            if tool_name in TOOL_SPECS:
-                from tool_permissions import audit_intent, needs_confirmation, propose
-
-                if needs_confirmation(tool_name):
-                    proposal = (
-                        f"[PROPUESTA] Ejecutar: {raw}. "
-                        "Decime 'sí' para ejecutarlo o 'no' para cancelar."
-                    )
-                    intent = {
-                        "kind": "command",
-                        "user_id": 0,
-                        "tool": tool_name,
-                        "command": raw,
-                        "target": "",
-                        "proposal": proposal,
-                    }
-                    propose(0, intent)
-                    audit_intent(intent, "proposed")
-                    tool_results.append({
-                        "command": f"!ejecutar: {raw}",
-                        "output": proposal,
-                        "pending_confirmation": True,
-                    })
-                    continue
-            result = execute_command(raw)
-            tool_results.append(result)
-            continue
-
-        m_search = TOOL_SEARCH_RE.match(line)
-        if m_search:
-            query = m_search.group(1).strip()
-            output = search_web(query)
-            tool_results.append({"command": f"buscar: {query}", "output": output})
-            continue
-
-        m_read = TOOL_READ_RE.match(line)
-        if m_read:
-            result = TOOL_HANDLERS["read"](m_read.group(1).strip())
-            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
-            continue
-
-        m_readpdf = TOOL_READPDF_RE.match(line)
-        if m_readpdf:
-            result = TOOL_HANDLERS["readpdf"](m_readpdf.group(1).strip())
-            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
-            continue
-
-        m_write = TOOL_WRITE_RE.match(line)
-        if m_write:
-            result = TOOL_HANDLERS["write"](m_write.group(1).strip())
-            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
-            continue
-        m_grep = TOOL_GREP_RE.match(line)
-        if m_grep:
-            result = TOOL_HANDLERS["grep"](m_grep.group(1).strip())
-            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
-            continue
-        m_glob = TOOL_GLOB_RE.match(line)
-        if m_glob:
-            result = TOOL_HANDLERS["glob"](m_glob.group(1).strip())
-            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
-            continue
-        m_fetch = TOOL_FETCH_RE.match(line)
-        if m_fetch:
-            result = TOOL_HANDLERS["fetch"](m_fetch.group(1).strip())
-            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
-            continue
-
-        m_edit = TOOL_EDIT_RE.match(line)
-        if m_edit:
-            result = TOOL_HANDLERS["edit"](m_edit.group(1).strip())
-            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
-            continue
-        m_preguntar = TOOL_PREGUNTAR_RE.match(line)
-        if m_preguntar:
-            result = TOOL_HANDLERS["preguntar"](m_preguntar.group(1).strip())
-            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
-            continue
-        m_tareas = TOOL_TAREAS_RE.match(line)
-        if m_tareas:
-            result = TOOL_HANDLERS["tareas"](m_tareas.group(1).strip())
-            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
-            continue
-        m_explorar = TOOL_EXPLORAR_RE.match(line)
-        if m_explorar:
-            result = TOOL_HANDLERS["explorar"](m_explorar.group(1).strip())
-            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
-            continue
-        m_razonar = TOOL_RAZONAR_RE.match(line)
-        if m_razonar:
-            result = TOOL_HANDLERS["razonar"](m_razonar.group(1).strip())
-            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
-            continue
-
-        m_mover = TOOL_MOVER_RE.match(line)
-        if m_mover:
-            result = TOOL_HANDLERS["mover"](m_mover.group(1).strip())
-            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
-            continue
-        m_copiar = TOOL_COPIAR_RE.match(line)
-        if m_copiar:
-            result = TOOL_HANDLERS["copiar"](m_copiar.group(1).strip())
-            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
-            continue
-        m_eliminar = TOOL_ELIMINAR_RE.match(line)
-        if m_eliminar:
-            result = TOOL_HANDLERS["eliminar"](m_eliminar.group(1).strip())
-            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
-            continue
-        m_ver = TOOL_VER_RE.match(line)
-        if m_ver:
-            result = TOOL_HANDLERS["ver"](m_ver.group(1).strip())
-            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
-            continue
-        m_revisar = TOOL_REVISAR_RE.match(line)
-        if m_revisar:
-            result = TOOL_HANDLERS["revisar"](m_revisar.group(1).strip())
-            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
-            continue
-        m_diff = TOOL_DIFF_RE.match(line)
-        if m_diff:
-            result = TOOL_HANDLERS["diff"](m_diff.group(1).strip())
-            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
-            continue
-        m_crear = TOOL_CREAR_RE.match(line)
-        if m_crear:
-            result = TOOL_HANDLERS["crear"](m_crear.group(1).strip())
-            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
-            continue
-        m_github = TOOL_GITHUB_RE.match(line)
-        if m_github:
-            result = TOOL_HANDLERS["github"](m_github.group(1).strip())
-            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
-            continue
-        m_navegar = TOOL_NAVEGAR_RE.match(line)
-        if m_navegar:
-            result = TOOL_HANDLERS["navegar"](m_navegar.group(1).strip())
-            tool_results.append({"command": line.strip(), "output": json.dumps(result, ensure_ascii=False)[:8000]})
-            continue
-
-        cleaned.append(line)
-
-    return "\n".join(cleaned), tool_results
-
-# ─── Gobernanza de herramientas: permisos y modo plan/build ───
-
-CONFIRMATION_YES_RE = re.compile(
-    r'^\s*(s[ií]|dale|adelante|ok|okay|confirm[oó]|s[ií] dale|d[aá]le noma[sz].*)\s*[.!]*\s*$',
-    re.IGNORECASE,
-)
-CONFIRMATION_NO_RE = re.compile(
-    r'^\s*(no|cancel[aá]|par[aá]|nope|no lo hagas|no corras|rechaz[aá]o)\s*[.!]*\s*$',
-    re.IGNORECASE,
-)
-MODE_SET_RE = re.compile(r'modo\s+(plan|build)', re.IGNORECASE)
-MODE_QUERY_RE = re.compile(
-    r'(en\s?que\s?modo\s?est[aá]s?|modo\s?actual|qu[eé]\s?modo|est[aá]s\s?en\s?modo)',
-    re.IGNORECASE,
-)
-PERM_STATUS_RE = re.compile(
-    r'(qu[eé]\s?herramientas.*confirmaci[óo]n|estado.*(permisos?|confirmaci[óo]n|config.)|pid[e].*confirmaci[óo]n.*a[h]ora|confirmaci[óo]n.*activ[aá]da)',
-    re.IGNORECASE,
-)
-ENABLE_CONF_RE = re.compile(
-    r'(confirmaci[óo]n|ped[ií]|pedime|pregunt[áa]s?|avis[áa]s?|avis[aá]me|quer[eé](s)?\s?que)', re.IGNORECASE)
-DISABLE_CONF_RE = re.compile(
-    r'(dej[aá]\s?de pregunt|dej[aá]|basta|no\s?(me\s?)?preguntes?|no\s?(me\s?)?avis[aá]s?|sin\s?confirmaci[óo]n)',
-    re.IGNORECASE,
-)
-
-
-def _run_pending(intent: dict) -> dict:
-    """Ejecuta de verdad la propuesta que el usuario confirmó."""
-    if intent["kind"] == "tool":
-        result = tools_engine.run_tool(
-            intent["tool"],
-            intent["target"],
-            profile=intent.get("profile", "default"),
-            options=intent.get("options") or {},
-            timeout=intent.get("timeout"),
-            user_id=intent.get("user_id", 0),
-            force_execution=True,
-        )
-        output = (result.stdout or result.stderr or result.error or "").strip()
-        ok = result.success
-    else:
-        result = execute_command(intent.get("command", ""))
-        output = result.get("output", "")
-        ok = result.get("success", False)
-
-    head = "✅ Confirmado y ejecutado." if ok else "⚠️ Confirmado pero la ejecución falló."
-    return {
-        "response": f"{head}\n\n{intent.get('proposal', '')}\n\n{output}",
-        "tool_output": output,
-    }
-
-
-def handle_special_message(message: str, user_id: int = 0) -> dict | None:
-    """Mensajes que Artenisa resuelve sin el LLM:
-    - confirmación/rechazo de una herramienta pendiente
-    - activar/desactivar confirmación por herramienta
-    - modo plan/build
-    - consulta de estado de permisos.
-    Devuelve None si el mensaje no es de gobernanza."""
-    message = message.strip()
-    if not message:
-        return None
-
-    if tool_permissions.has_pending(user_id):
-        if CONFIRMATION_YES_RE.match(message):
-            intent = tool_permissions.resolve_pending(user_id, confirmed=True)
-            return _run_pending(intent) if intent else {
-                "response": "No había ninguna acción pendiente de confirmación."
-            }
-        if CONFIRMATION_NO_RE.match(message):
-            tool_permissions.resolve_pending(user_id, confirmed=False)
-            return {"response": "Cancelado. No ejecuto nada."}
-
-    lower = message.lower()
-    m_mode = MODE_SET_RE.search(lower)
-    if m_mode:
-        mode = tool_permissions.set_agent_mode(m_mode.group(1).lower())
-        return {"response": f"Ok. Modo {mode} activado."}
-
-    if MODE_QUERY_RE.search(lower) or PERM_STATUS_RE.search(lower):
-        mode = tool_permissions.get_agent_mode()
-        enabled = [p["tool_name"] for p in tool_permissions.list_permissions() if p["requires_confirmation"]]
-        line = "Ninguna herramienta pide confirmación individual."
-        if enabled:
-            line = "Confirmación individual activada para: " + ", ".join(enabled) + "."
-        return {"response": f"Modo actual: {mode}. {line}"}
-
-    words = set(re.findall(r"[a-z0-9][\w\-]*", lower))
-    found = [t for t in TOOL_SPECS if t in words]
-    if found:
-        if DISABLE_CONF_RE.search(lower):
-            for t in found:
-                tool_permissions.set_permission(t, False)
-            return {"response": f"Ok, no te vuelvo a pedir confirmación por {', '.join(found)}."}
-        if ENABLE_CONF_RE.search(lower):
-            for t in found:
-                tool_permissions.set_permission(t, True)
-            return {
-                "response": (
-                    f"Ok. A partir de ahora te pido confirmación antes de usar {', '.join(found)} "
-                    f"(modo actual: {tool_permissions.get_agent_mode()})."
-                )
-            }
-
-    return None
 
 # ─── Endpoints ───
 
@@ -1109,57 +494,27 @@ def chat(req: ChatRequest, authorization: str = Header(None)):
 
     conv_id = req.conversation_id or str(uuid.uuid4())
 
-    special = handle_special_message(req.message)
-    if special:
-        final_text = special.get("response", "")
-        tool_output = special.get("tool_output")
-        save_message(conv_id, "user", req.message)
-        save_message(conv_id, "assistant", final_text, tool_output)
-        return ChatResponse(
-            response=final_text,
-            conversation_id=conv_id,
-            tool_executed=bool(tool_output),
-            tool_command=special.get("tool_command"),
-            tool_output=tool_output[:2000] if tool_output else None,
-        )
-
     memories = load_all_memories()
     history = get_history(conv_id) if req.conversation_id else []
     prompt = build_prompt(history, req.message, memories)
 
     response_text = call_ollama(prompt)
-    cleaned_text, tool_results = process_tool_commands(response_text)
-
-    if tool_results:
-        tool_context = "\n".join(
-            f"Comando: {r.get('command', '')}\nSalida:\n{r.get('output', '')}"
-            for r in tool_results
-        )
-        analysis_prompt = (
-            f"{TOOL_ANALYSIS_PROMPT}\n\n"
-            f"Comando: {tool_results[0].get('command', '')}\n\n"
-            f"Resultado:\n{tool_context}\n\n"
-            f"Usuario: {req.message}"
-        )
-        final_text = call_ollama(analysis_prompt, temperature=0.7)
-    else:
-        final_text = cleaned_text
+    final_text = response_text.strip()
 
     save_message(conv_id, "user", req.message)
-    save_message(conv_id, "assistant", final_text,
-                 tool_results[0]["output"] if tool_results else None)
+    save_message(conv_id, "assistant", final_text)
 
     trigger_memory_extraction(req.message, final_text)
 
     elapsed = (datetime.utcnow() - start).total_seconds()
-    log.info(f"Chat [{conv_id[:8]}] {elapsed:.1f}s | tools={len(tool_results)} | hist={len(history)}")
+    log.info(f"Chat [{conv_id[:8]}] {elapsed:.1f}s | hist={len(history)}")
 
     return ChatResponse(
         response=final_text,
         conversation_id=conv_id,
-        tool_executed=len(tool_results) > 0,
-        tool_command=tool_results[0].get("command") if tool_results else None,
-        tool_output=tool_results[0].get("output")[:2000] if tool_results else None
+        tool_executed=False,
+        tool_command=None,
+        tool_output=None
     )
 
 @app.post("/chat/stream")
@@ -1173,15 +528,6 @@ def chat_stream(req: ChatRequest, authorization: str = Header(None)):
     def event_generator():
         full_response = []
         try:
-            special = handle_special_message(req.message)
-            if special:
-                final_text = special.get("response", "")
-                tool_output = special.get("tool_output")
-                save_message(conv_id, "user", req.message)
-                save_message(conv_id, "assistant", final_text, tool_output)
-                yield f"data: {json.dumps({'type': 'done', 'conversation_id': conv_id, 'response': final_text, 'tool_executed': bool(tool_output), 'tool_command': special.get('tool_command'), 'tool_output': (tool_output or '')[:2000]})}\n\n"
-                return
-
             p = _get_provider()
             for token in p.generate_stream(prompt):
                 full_response.append(token)
@@ -1199,35 +545,19 @@ def chat_stream(req: ChatRequest, authorization: str = Header(None)):
             return
 
         try:
-            cleaned_text, tool_results = process_tool_commands("".join(full_response))
-
-            if tool_results:
-                tool_context = "\n".join(
-                    f"Comando: {r.get('command', '')}\nSalida:\n{r.get('output', '')}"
-                    for r in tool_results
-                )
-                analysis_prompt = (
-                    f"{TOOL_ANALYSIS_PROMPT}\n\n"
-                    f"Comando: {tool_results[0].get('command', '')}\n\n"
-                    f"Resultado:\n{tool_context}\n\n"
-                    f"Usuario: {req.message}"
-                )
-                final_text = call_ollama(analysis_prompt, temperature=0.7)
-            else:
-                final_text = cleaned_text
+            final_text = "".join(full_response).strip()
 
             save_message(conv_id, "user", req.message)
-            save_message(conv_id, "assistant", final_text,
-                         tool_results[0]["output"] if tool_results else None)
+            save_message(conv_id, "assistant", final_text)
             trigger_memory_extraction(req.message, final_text)
 
             result = {
                 "type": "done",
                 "conversation_id": conv_id,
                 "response": final_text,
-                "tool_executed": len(tool_results) > 0,
-                "tool_command": tool_results[0].get("command") if tool_results else None,
-                "tool_output": tool_results[0].get("output")[:2000] if tool_results else None
+                "tool_executed": False,
+                "tool_command": None,
+                "tool_output": None
             }
             yield f"data: {json.dumps(result)}\n\n"
 
@@ -1291,20 +621,6 @@ def search(query: str, authorization: str = Header(None)):
     verify_token(authorization)
     log.info(f"Search: {query}")
     return {"query": query, "results": search_web(query)}
-
-@app.post("/execute")
-def execute(command: str = Form(...), authorization: str = Header(None)):
-    verify_token(authorization)
-    log.info(f"Execute: {command[:100]}")
-    return execute_command(command)
-
-@app.post("/execute-body")
-def execute_body(data: dict = Body(...), authorization: str = Header(None)):
-    verify_token(authorization)
-    cmd = data.get("command", "")
-    if not cmd:
-        raise HTTPException(400, "command requerido")
-    return execute_command(cmd)
 
 @app.get("/history/{conversation_id}")
 def get_history_endpoint(conversation_id: str, authorization: str = Header(None)):
@@ -1595,14 +911,6 @@ async def tool_browse(data: dict = Body({}), authorization: str = Header(None)):
         return await _run_browser(url, action)
     except Exception as e:
         raise HTTPException(500, f"Error navegando: {e}")
-
-
-@app.post("/tools/interrupt")
-def tool_interrupt(authorization: str = Header(None)):
-    verify_token(authorization)
-    global TOOL_INTERRUPTED
-    TOOL_INTERRUPTED = True
-    return {"ok": True}
 
 
 @app.post("/tools/readpdf")
