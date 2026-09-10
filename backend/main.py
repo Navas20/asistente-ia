@@ -27,6 +27,8 @@ from playbooks import list_playbooks, run_playbook
 from report_generator import generate_report
 import tool_permissions
 import hacking
+import tools_engine
+from tools_engine import tools_engine as tool_engine
 
 try:
     import voice as voice_module
@@ -146,6 +148,9 @@ def init_db():
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id)")
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
+        if "tool_calls" not in cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN tool_calls TEXT")
         log.info("Base de datos inicializada")
 
     tool_permissions.init_permissions()
@@ -199,17 +204,19 @@ def verify_token(authorization: str = Header(None)):
 
 # ─── DB helpers ───
 
-def save_message(conv_id: str, role: str, content: str, tool_output: str = None):
+def save_message(conv_id: str, role: str, content: str, tool_output: str = None, tool_calls: list = None):
     with db() as conn:
         conn.execute(
-            "INSERT INTO messages (conversation_id, role, content, tool_output, timestamp) VALUES (?, ?, ?, ?, ?)",
-            (conv_id, role, content, tool_output, datetime.utcnow().isoformat())
+            "INSERT INTO messages (conversation_id, role, content, tool_output, tool_calls, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+            (conv_id, role, content, tool_output,
+             json.dumps(tool_calls, ensure_ascii=False) if tool_calls else None,
+             datetime.utcnow().isoformat())
         )
 
 def get_history(conv_id: str, limit: int = MAX_HISTORY) -> list:
     with db() as conn:
         rows = conn.execute(
-            "SELECT role, content, tool_output FROM messages WHERE conversation_id = ? ORDER BY id ASC",
+            "SELECT role, content, tool_output, tool_calls FROM messages WHERE conversation_id = ? ORDER BY id ASC",
             (conv_id,)
         ).fetchall()
     result = []
@@ -217,6 +224,11 @@ def get_history(conv_id: str, limit: int = MAX_HISTORY) -> list:
         entry = {"role": r["role"], "content": r["content"]}
         if r["tool_output"]:
             entry["tool_output"] = r["tool_output"]
+        if r["tool_calls"]:
+            try:
+                entry["tool_calls"] = json.loads(r["tool_calls"])
+            except (json.JSONDecodeError, TypeError):
+                pass
         result.append(entry)
     return result[-limit:]
 
@@ -418,6 +430,244 @@ def build_prompt(history: list, new_message: str, memories: dict) -> str:
     parts.append("<|im_start|>assistant\n")
     return "\n".join(parts)
 
+
+# ─── Tool Calling nativo (OpenAI-compat con Ollama) ───
+
+MAX_TOOL_TURNS = int(os.getenv("MAX_TOOL_TURNS", "4"))
+
+_CONFIRM_YES_RE = re.compile(
+    r'^\s*(s[ií]|dale|adelante|ok|okay|confirm[oó])\s*[.!]*\s*$', re.IGNORECASE)
+_CONFIRM_NO_RE = re.compile(
+    r'^\s*(no|cancel[aá]|par[aá]|nope|no lo hagas|no corras)\s*[.!]*\s*$', re.IGNORECASE)
+
+
+def _is_yes(text: str) -> bool:
+    return bool(_CONFIRM_YES_RE.match(text.strip()))
+
+
+def _is_no(text: str) -> bool:
+    return bool(_CONFIRM_NO_RE.match(text.strip()))
+
+
+def _tool_output_text(result) -> str:
+    if getattr(result, "pending_confirmation", False):
+        return result.stdout
+    if getattr(result, "error", ""):
+        return f"[Error] {result.error}"
+    return (result.stdout or result.stderr or "").strip() or "(sin salida)"
+
+
+def _api_tool_calls(tool_calls: list) -> list:
+    """Normaliza los tool_calls del provider al shape API (id, type, function{name, arguments})."""
+    out = []
+    for tc in tool_calls:
+        out.append({
+            "id": tc.get("id", f"call_{len(out)}"),
+            "type": "function",
+            "function": {
+                "name": tc.get("name", ""),
+                "arguments": json.dumps(tc.get("arguments") or {}, ensure_ascii=False),
+            },
+        })
+    return out
+
+
+def _system_text() -> str:
+    text = ""
+    mem_block = format_memories(load_all_memories())
+    if mem_block:
+        text += mem_block + "\n"
+    jailbreak = get_system_prompt()
+    if jailbreak:
+        text += jailbreak + "\n"
+    text += SYSTEM_PROMPT
+    return text
+
+
+def _history_to_messages(conv_id: str) -> list:
+    """Construye el array messages (roles chat+tool) desde el historial persistido."""
+    messages = [{"role": "system", "content": _system_text()}]
+    for h in get_history(conv_id):
+        role = h.get("role")
+        if role == "tool":
+            messages.append({
+                "role": "tool",
+                "tool_call_id": h.get("content", "") or "",
+                "content": h.get("tool_output") or h.get("content", ""),
+            })
+        elif role == "assistant" and h.get("tool_calls"):
+            messages.append({
+                "role": "assistant",
+                "content": h.get("content") or "",
+                "tool_calls": h["tool_calls"],
+            })
+        else:
+            messages.append({
+                "role": role if role in ("system", "user", "assistant") else "user",
+                "content": h.get("content", ""),
+            })
+    return messages
+
+
+def _append_tool_turn(messages: list, resp: dict, tc: dict, output: str, conv_id: str) -> None:
+    api_calls = _api_tool_calls(resp.get("tool_calls") or [])
+    assistant = {"role": "assistant", "content": resp.get("content") or "", "tool_calls": api_calls}
+    messages.append(assistant)
+    save_message(conv_id, "assistant", assistant["content"], tool_calls=api_calls)
+    save_message(conv_id, "tool", tc.get("id", "call_?"), output)
+    messages.append({"role": "tool", "tool_call_id": tc.get("id", "call_?"), "content": output})
+
+
+def _run_tool_loop(conv_id: str, message: str, user_id: int = 0) -> dict:
+    provider = _get_provider()
+    save_message(conv_id, "user", message)
+    messages = _history_to_messages(conv_id)
+    tools = tools_engine.build_openai_tools()
+    last_exec: tuple | None = None
+
+    for _ in range(MAX_TOOL_TURNS):
+        resp = provider.chat(messages, tools)
+        tool_calls = resp.get("tool_calls") or []
+        if not tool_calls:
+            final = resp.get("content", "") or ""
+            save_message(conv_id, "assistant", final)
+            trigger_memory_extraction(message, final)
+            return {
+                "response": final,
+                "tool_executed": bool(last_exec),
+                "tool_command": last_exec[0] if last_exec else None,
+                "tool_output": last_exec[1] if last_exec else None,
+            }
+
+        for tc in tool_calls:
+            parsed = tools_engine.parse_tool_call(tc.get("name", ""), tc.get("arguments"))
+            if parsed is None:
+                _append_tool_turn(
+                    messages, resp, tc,
+                    f"[Error] La herramienta '{tc.get('name', '')}' no está soportada.", conv_id,
+                )
+                continue
+
+            tool, target, profile, options, timeout = parsed
+            intent = {
+                "kind": "tool",
+                "user_id": user_id,
+                "tool": tool,
+                "target": target,
+                "profile": profile,
+                "options": options,
+                "timeout": timeout,
+                "tool_call_id": tc.get("id", f"call_{tool}"),
+            }
+
+            if tool_permissions.needs_confirmation(tool):
+                intent["proposal"] = (
+                    f"[PROPUESTA] Ejecutar {tool} -> target: {target}"
+                    f", perfil: {profile}, timeout: {timeout or 'default'}s."
+                    " Decime 'sí' para ejecutarlo o 'no' para cancelar."
+                )
+                tool_permissions.propose(user_id, intent)
+                tool_permissions.audit_intent(intent, "proposed")
+                save_message(conv_id, "assistant", intent["proposal"])
+                return {
+                    "response": intent["proposal"],
+                    "tool_executed": False,
+                    "tool_command": f"!{tool}",
+                    "tool_output": intent["proposal"],
+                }
+
+            result = tool_engine.run_tool(
+                tool, target, profile=profile, options=options, timeout=timeout,
+                user_id=user_id, force_execution=True,
+            )
+            output = _tool_output_text(result)
+            last_exec = (tool, output[:2000])
+            _append_tool_turn(messages, resp, tc, output, conv_id)
+
+    final = "Llegué al máximo de iteraciones de herramientas sin llegar a un cierre. Intentá ser más específico."
+    save_message(conv_id, "assistant", final)
+    trigger_memory_extraction(message, final)
+    return {
+        "response": final,
+        "tool_executed": bool(last_exec),
+        "tool_command": last_exec[0] if last_exec else None,
+        "tool_output": last_exec[1] if last_exec else None,
+    }
+
+
+def _run_confirmed(conv_id: str, message: str, intent: dict, user_id: int = 0) -> dict:
+    provider = _get_provider()
+    save_message(conv_id, "user", message)
+    result = tool_engine.run_tool(
+        intent["tool"], intent["target"], profile=intent["profile"],
+        options=intent["options"], timeout=intent["timeout"],
+        user_id=user_id, force_execution=True,
+    )
+    output = _tool_output_text(result)
+    tc_id = intent.get("tool_call_id") or f"call_{intent['tool']}"
+    api_calls = [{
+        "id": tc_id,
+        "type": "function",
+        "function": {
+            "name": intent["tool"],
+            "arguments": json.dumps({
+                "target": intent["target"],
+                "profile": intent["profile"],
+                "options": intent["options"],
+                "timeout": intent["timeout"],
+            }, ensure_ascii=False),
+        },
+    }]
+    messages = _history_to_messages(conv_id)
+    messages.append({"role": "assistant", "content": intent.get("proposal") or "", "tool_calls": api_calls})
+    messages.append({"role": "tool", "tool_call_id": tc_id, "content": output})
+
+    resp = provider.chat(messages, tools_engine.build_openai_tools())
+    final = resp.get("content", "") or ""
+    if not final.strip():
+        final = f"Ejecutado {intent['tool']}.\n\n{output}"
+    save_message(conv_id, "assistant", final)
+    trigger_memory_extraction(message, final)
+    return {
+        "response": final,
+        "tool_executed": True,
+        "tool_command": intent["tool"],
+        "tool_output": output[:2000],
+    }
+
+
+def _resolve_turn(conv_id: str, message: str, user_id: int = 0) -> dict:
+    """Resuelve un turno: confirmación pendiente primero, luego tool-loop o fallback clásico."""
+    if tool_permissions.has_pending(user_id):
+        if _is_no(message):
+            tool_permissions.resolve_pending(user_id, confirmed=False)
+            save_message(conv_id, "user", message)
+            final = "Cancelado. No ejecuto nada."
+            save_message(conv_id, "assistant", final)
+            return {"response": final, "tool_executed": False, "tool_command": None, "tool_output": None}
+        if _is_yes(message):
+            intent = tool_permissions.resolve_pending(user_id, confirmed=True)
+            if intent:
+                return _run_confirmed(conv_id, message, intent, user_id)
+
+    provider = _get_provider()
+    if getattr(provider, "supports_tools", False):
+        return _run_tool_loop(conv_id, message, user_id)
+
+    # Fallback clásico: prompt en string, sin tools.
+    save_message(conv_id, "user", message)
+    prompt = build_prompt(get_history(conv_id), message, load_all_memories())
+    final = provider.generate(prompt, 0.85).strip()
+    save_message(conv_id, "assistant", final)
+    trigger_memory_extraction(message, final)
+    return {"response": final, "tool_executed": False, "tool_command": None, "tool_output": None}
+
+
+def _chunk_text(text: str, size: int = 40):
+    for i in range(0, len(text), size):
+        yield text[i:i + size]
+
+
 def search_web(query: str) -> str:
     try:
         domain_filter = None
@@ -494,47 +744,33 @@ def chat(req: ChatRequest, authorization: str = Header(None)):
 
     conv_id = req.conversation_id or str(uuid.uuid4())
 
-    memories = load_all_memories()
-    history = get_history(conv_id) if req.conversation_id else []
-    prompt = build_prompt(history, req.message, memories)
-
-    response_text = call_ollama(prompt)
-    final_text = response_text.strip()
-
-    save_message(conv_id, "user", req.message)
-    save_message(conv_id, "assistant", final_text)
-
-    trigger_memory_extraction(req.message, final_text)
+    result = _resolve_turn(conv_id, req.message)
 
     elapsed = (datetime.utcnow() - start).total_seconds()
-    log.info(f"Chat [{conv_id[:8]}] {elapsed:.1f}s | hist={len(history)}")
+    log.info(f"Chat [{conv_id[:8]}] {elapsed:.1f}s | tool={bool(result['tool_executed']) if result['tool_command'] else '-'}")
 
     return ChatResponse(
-        response=final_text,
+        response=result["response"],
         conversation_id=conv_id,
-        tool_executed=False,
-        tool_command=None,
-        tool_output=None
+        tool_executed=result["tool_executed"],
+        tool_command=result["tool_command"],
+        tool_output=result["tool_output"],
     )
 
 @app.post("/chat/stream")
 def chat_stream(req: ChatRequest, authorization: str = Header(None)):
     verify_token(authorization)
     conv_id = req.conversation_id or str(uuid.uuid4())
-    memories = load_all_memories()
-    history = get_history(conv_id) if req.conversation_id else []
-    prompt = build_prompt(history, req.message, memories)
 
     def event_generator():
-        full_response = []
         try:
-            p = _get_provider()
-            for token in p.generate_stream(prompt):
-                full_response.append(token)
-                yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+            result = _resolve_turn(conv_id, req.message)
+        except HTTPException as e:
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e.detail)})}\n\n"
+            return
         except Exception as e:
             err_msg = str(e)
-            log.error(f"Error streaming: {err_msg}")
+            log.error(f"Error resolviendo turno: {err_msg}")
             if "429" in err_msg:
                 friendly = "Límite de requests excedido (OpenRouter free). Espera unos segundos y vuelve a intentar."
             elif "Timeout" in err_msg:
@@ -544,25 +780,10 @@ def chat_stream(req: ChatRequest, authorization: str = Header(None)):
             yield f"data: {json.dumps({'type': 'error', 'error': friendly})}\n\n"
             return
 
-        try:
-            final_text = "".join(full_response).strip()
+        for chunk in _chunk_text(result["response"]):
+            yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
 
-            save_message(conv_id, "user", req.message)
-            save_message(conv_id, "assistant", final_text)
-            trigger_memory_extraction(req.message, final_text)
-
-            result = {
-                "type": "done",
-                "conversation_id": conv_id,
-                "response": final_text,
-                "tool_executed": False,
-                "tool_command": None,
-                "tool_output": None
-            }
-            yield f"data: {json.dumps(result)}\n\n"
-
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+        yield f"data: {json.dumps({'type': 'done', 'conversation_id': conv_id, 'response': result['response'], 'tool_executed': result['tool_executed'], 'tool_command': result['tool_command'], 'tool_output': (result['tool_output'] or '')[:2000]})}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

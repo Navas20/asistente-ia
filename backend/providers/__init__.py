@@ -25,6 +25,7 @@ class BaseProvider:
     env_model = ""
     default_model = ""
     default_url = ""
+    supports_tools = False
 
     def __init__(self):
         self.api_key = os.getenv(self.env_key, "")
@@ -37,6 +38,13 @@ class BaseProvider:
 
     def generate_stream(self, prompt: str, temperature: float = 0.85) -> Generator[str, None, None]:
         raise NotImplementedError
+
+    def chat(self, messages: list, tools: list | None = None, temperature: float = 0.7) -> dict:
+        """Chat con Tool Calling nativo (formato OpenAI-compat).
+
+        messages: lista de diccionarios {role, content, tool_calls, tool_call_id}.
+        Retorna normalize: {"content": str, "tool_calls": [{id, name, arguments: dict}]}."""
+        raise NotImplementedError(f"Provider '{self.name}' no implementa chat() con tools")
 
     def list_models(self) -> list:
         return [self.model]

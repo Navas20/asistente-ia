@@ -283,6 +283,83 @@ def list_tool_specs() -> list[dict[str, Any]]:
     ]
 
 
+def _synth_parameters(spec: dict) -> dict:
+    hint = {
+        "host": "Dominio o IP pública a analizar",
+        "url": "URL completa con http:// o https://",
+        "none": "",
+    }
+    properties: dict = {}
+    required: list = []
+    if spec.get("target_kind") != "none":
+        properties["target"] = {
+            "type": "string",
+            "description": hint.get(spec["target_kind"], "Objetivo a analizar"),
+        }
+        required.append("target")
+    profiles = spec.get("profiles") or ["default"]
+    properties["profile"] = {
+        "type": "string",
+        "enum": profiles,
+        "description": "Perfil de intensidad de la ejecución",
+        "default": "normal" if "normal" in profiles else profiles[0],
+    }
+    if spec.get("max_timeout"):
+        properties["timeout"] = {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": spec["max_timeout"],
+            "description": "Timeout de la ejecución en segundos",
+        }
+    properties["options"] = {
+        "type": "object",
+        "description": "Opciones extra (ej: extra_args: lista de argumentos adicionales)",
+        "additionalProperties": True,
+    }
+    return {"type": "object", "properties": properties, "required": required}
+
+
+def build_openai_tools(tools: list[str] | None = None) -> list[dict]:
+    """Convierte TOOL_SPECS al array 'tools' que espera la API OpenAI-compat de Ollama.
+
+    Si una tool del catálogo define 'parameters' (JSON Schema completo), se usa tal cual;
+    si no, el schema se sintetiza desde target_kind/profiles/timeout."""
+    names = set(tools) if tools else set(TOOL_SPECS)
+    out = []
+    for name, spec in TOOL_SPECS.items():
+        if name not in names:
+            continue
+        parameters = spec.get("parameters") or _synth_parameters(spec)
+        out.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": spec.get("description", name),
+                "parameters": parameters,
+            },
+        })
+    return out
+
+
+def parse_tool_call(name: str, arguments: dict | None):
+    """Mapea un tool_call emitido por el modelo a la firma de run_tool.
+
+    Devuelve (tool, target, profile, options, timeout) o None si la tool es desconocida.
+    La validación fuerte (target, perfil, timeout) la hace run_tool."""
+    spec = TOOL_SPECS.get(name)
+    if not spec:
+        return None
+    args = arguments or {}
+    target = str(args.get("target", "") or "").strip()
+    profile = str(args.get("profile", "") or (spec["profiles"][0] if spec["profiles"] else "default"))
+    options = args.get("options") or {}
+    if not isinstance(options, dict):
+        options = {}
+    timeout = args.get("timeout")
+    timeout = int(timeout) if timeout else None
+    return name, target, profile, options, timeout
+
+
 class ToolsEngine:
     def __init__(self, base_url: str = KALI_BASE_URL):
         self.base_url = base_url
