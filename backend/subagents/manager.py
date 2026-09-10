@@ -63,7 +63,7 @@ class SubagentManager:
         TASKS_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def launch(self, name: str, target: str, task: str, model: str = "",
-               provider: str = "openrouter", parent_id: str = "") -> SubagentTask:
+               provider: str = "ollama", parent_id: str = "") -> SubagentTask:
         with self._lock:
             active = sum(1 for t in self._tasks if t.status == "running")
             t = SubagentTask(
@@ -82,7 +82,7 @@ class SubagentManager:
                 self._pending_queue.put_nowait((t.id, t))
             except queue.Full:
                 t.status = "failed"
-                t.error = "Queue full (max queued reached)"
+                t.error = "Cola llena (máximo de pendientes alcanzado)"
                 self._save()
         return t
 
@@ -95,7 +95,7 @@ class SubagentManager:
             provider = get_provider(task.provider)
             if not provider:
                 task.status = "failed"
-                task.error = f"Provider '{task.provider}' not available"
+                task.error = f"El proveedor '{task.provider}' no está disponible"
                 self._save()
                 return
             prompt = f"Target: {task.target}\nTask: {task.task}\nExecute tools and analyze. Return findings."

@@ -83,7 +83,7 @@ class Screen:
             "context_pct": 0,
             "cost": 0.0,
             "model": "",
-            "provider": "openrouter",
+            "provider": "ollama",
             "jailbreak": False,
             "mcp": [],
             "version": "",

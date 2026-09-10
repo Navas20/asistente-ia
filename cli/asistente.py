@@ -34,7 +34,7 @@ if sys.platform == "win32":
 conv_id = None
 voice_mode = False
 current_model = ""
-current_provider = "openrouter"
+current_provider = "ollama"
 jailbreak_mode = False
 session_start = time.time()
 session_tokens = "∞"
@@ -183,10 +183,10 @@ def main():
         if "models" in data:
             models = data["models"]
             current_model = data.get("current", models[0] if models else "?")
-            current_provider = data.get("provider", "openrouter")
+            current_provider = data.get("provider", "ollama")
         else:
             current_model = "?"
-            current_provider = "openrouter"
+            current_provider = "ollama"
 
         screen.set_session(
             model=current_model,

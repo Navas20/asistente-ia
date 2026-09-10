@@ -14,7 +14,7 @@ def launch_subagent(task: SubagentTask):
         target=task.target,
         task=task.task,
         model=task.model,
-        provider=task.provider or "openrouter",
+        provider=task.provider or "ollama",
         parent_id=task.parent_id,
     )
     return t.model_dump()
@@ -29,14 +29,14 @@ def list_subagents(status: str | None = Query(None)):
 def get_subagent(task_id: str):
     t = manager.get(task_id)
     if not t:
-        raise HTTPException(404, "Subagent task not found")
+        raise HTTPException(404, "Tarea de subagente no encontrada")
     return t
 
 
 @router.post("/{task_id}/cancel")
 def cancel_subagent(task_id: str):
     if not manager.cancel(task_id):
-        raise HTTPException(400, "Task not running or not found")
+        raise HTTPException(400, "La tarea no está en ejecución o no existe")
     return {"ok": True}
 
 

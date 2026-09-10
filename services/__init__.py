@@ -4,7 +4,7 @@ SERVICES LAYER - Lógica de negocio central
 Exporta las instancias de servicios globales:
 - chat_service: Manejo de conversaciones
 - memory_service: Sistema de memoria 3-capas
-- llm_service: Generación de texto vía OpenRouter
+- llm_service: Generación de texto vía Ollama (100% local)
 - audit_service: Auditoría de acciones
 - limiter: Rate limiting
 """

@@ -10,7 +10,7 @@ def register_provider(name: str, cls: type):
     PROVIDER_REGISTRY[name] = cls
 
 def get_provider(name: str = None):
-    name = name or os.getenv("ACTIVE_PROVIDER", "openrouter")
+    name = name or os.getenv("ACTIVE_PROVIDER", "ollama")
     cls = PROVIDER_REGISTRY.get(name)
     if not cls:
         raise ValueError(f"Provider '{name}' no encontrado. Disponibles: {list(PROVIDER_REGISTRY.keys())}")

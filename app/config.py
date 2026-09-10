@@ -17,16 +17,14 @@ REPORTS_DIR = Path(os.getenv("REPORTS_DIR", str(DATA_DIR / "reports")))
 AUDIO_DIR = Path(os.getenv("AUDIO_DIR", str(DATA_DIR / "audio")))
 
 # ─── Multi-Provider ───
-ACTIVE_PROVIDER = os.getenv("ACTIVE_PROVIDER", "openrouter")
+ACTIVE_PROVIDER = os.getenv("ACTIVE_PROVIDER", "ollama")
 
-# ─── OpenRouter ───
-OPENROUTER_URL = os.getenv("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemma-4-26b-a4b-it:free")
-OPENROUTER_TIMEOUT = int(os.getenv("OPENROUTER_TIMEOUT", "180"))
-OPENROUTER_MAX_RETRIES = int(os.getenv("OPENROUTER_MAX_RETRIES", "5"))
-OPENROUTER_NUM_PREDICT = int(os.getenv("OPENROUTER_NUM_PREDICT", "8192"))
-OPENROUTER_MIN_INTERVAL = float(os.getenv("OPENROUTER_MIN_INTERVAL", "6"))
+# ─── Ollama (100% local) ───
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://artenisa-ollama:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "artenisa")
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "600"))
+OLLAMA_MAX_RETRIES = int(os.getenv("OLLAMA_MAX_RETRIES", "1"))
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "400"))
 
 # ─── Groq ───
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")

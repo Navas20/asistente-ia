@@ -78,7 +78,7 @@ if _env_path.exists():
             os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "nex-agi/nex-n2-pro:free")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "artenisa")
 DB_PATH = os.getenv("DB_PATH", "data/conversations.db")
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "data/uploads"))
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
@@ -255,11 +255,11 @@ def save_memories_batch(memories: list):
 
 from providers import get_provider, list_providers, PROVIDER_REGISTRY
 
-import providers.openrouter
+import providers.ollama
 import providers.groq
 import providers.anthropic
 
-_current_provider_name = os.getenv("ACTIVE_PROVIDER", "openrouter")
+_current_provider_name = os.getenv("ACTIVE_PROVIDER", "ollama")
 
 def _get_provider():
     return get_provider(_current_provider_name)
@@ -733,7 +733,7 @@ def root():
     return {
         "status": "ok",
         "asistente": "Artenisa",
-        "modelo": OPENROUTER_MODEL,
+        "modelo": OLLAMA_MODEL,
         "features": ["chat", "tools", "search", "files", "memory", "voice", "web"]
     }
 
@@ -772,7 +772,7 @@ def chat_stream(req: ChatRequest, authorization: str = Header(None)):
             err_msg = str(e)
             log.error(f"Error resolviendo turno: {err_msg}")
             if "429" in err_msg:
-                friendly = "Límite de requests excedido (OpenRouter free). Espera unos segundos y vuelve a intentar."
+                friendly = "El modelo local (Ollama) no respondió. Revisá si el contenedor artenisa-ollama está arriba."
             elif "Timeout" in err_msg:
                 friendly = "El modelo tardó demasiado en responder. Intenta con un mensaje más corto."
             else:

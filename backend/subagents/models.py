@@ -11,7 +11,7 @@ class SubagentTask(BaseModel):
     target: str = ""
     task: str = ""
     model: str = ""
-    provider: str = "openrouter"
+    provider: str = "ollama"
     status: Literal["pending", "running", "completed", "failed", "cancelled"] = "pending"
     progress: int = 0
     result: str = ""
