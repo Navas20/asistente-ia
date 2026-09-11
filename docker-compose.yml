@@ -21,9 +21,18 @@ services:
       - UPLOAD_DIR=/data/uploads
       - ALLOWED_USER_IDS=${ALLOWED_USER_IDS}
       - KALI_TOOLS_URL=http://artenisa-kali-tools:9001
+      - IMAP_SERVER=${IMAP_SERVER}
+      - IMAP_PORT=${IMAP_PORT:-993}
+      - SMTP_SERVER=${SMTP_SERVER}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - EMAIL_USER=${EMAIL_USER}
+      - EMAIL_PASSWORD=${EMAIL_PASSWORD}
     volumes:
       - artenisa_data:/data
     restart: unless-stopped
+    cpuset: "4-5"
+    cpus: "1.0"
+    mem_limit: 512m
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 15s
@@ -34,10 +43,18 @@ services:
         condition: service_started
 
   artenisa-ollama:
-    image: ollama/ollama:latest
+    build:
+      context: docker/ollama
+      dockerfile: Dockerfile
+    image: artenisa-ollama:0.33.3-mmap
     container_name: artenisa-ollama
     expose:
       - "11434"
+    environment:
+      - OMP_NUM_THREADS=4
+      - OLLAMA_NUM_PARALLEL=1
+      - LLAMA_ARG_THREADS=${OLLAMA_THREADS:-8}
+    ipc: host
     volumes:
       - /var/lib/ollama:/root/.ollama/models
     healthcheck:
@@ -46,6 +63,9 @@ services:
       timeout: 5s
       retries: 3
     restart: unless-stopped
+    cpuset: "${OLLAMA_CPUSET:-0-7}"
+    cpus: "${OLLAMA_CPUS:-8}"
+    mem_limit: 8g
 
   artenisa-telegram-bot:
     build:
@@ -67,6 +87,8 @@ services:
       artenisa-backend:
         condition: service_healthy
     restart: unless-stopped
+    cpus: "0.5"
+    mem_limit: 256m
 
   artenisa-kali-tools:
     build:
@@ -89,6 +111,9 @@ services:
       retries: 3
       start_period: 10s
     restart: unless-stopped
+    cpuset: "8-9"
+    cpus: "2.0"
+    mem_limit: 512m
 
 volumes:
   artenisa_data:

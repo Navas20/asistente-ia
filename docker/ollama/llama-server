@@ -1,0 +1,9 @@
+#!/bin/bash
+args=()
+skip=0
+for a in "$@"; do
+  if [ "$skip" -eq 1 ]; then skip=0; continue; fi
+  if [ "$a" = "--load-mode" ]; then skip=1; continue; fi
+  args+=("$a")
+done
+exec /usr/lib/ollama/llama-server.real "${args[@]}"
